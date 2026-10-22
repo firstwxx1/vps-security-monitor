@@ -30,7 +30,7 @@ from datetime import datetime, timedelta
 from collections import Counter, defaultdict
 
 # ----------------- 路径与持久化文件 -----------------
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
 GEO_CACHE_FILE = os.path.join(SCRIPT_DIR, "ip_geo_cache.json")
 STATE_FILE = os.path.join(SCRIPT_DIR, "monitor_state.json")

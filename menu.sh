@@ -11,7 +11,19 @@ PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 PLAIN='\033[0m'
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 正确解析软链接获取真实物理路径 (防止 /usr/local/bin/vps-guard 调用时路径漂移)
+if command -v readlink &>/dev/null; then
+    REAL_SCRIPT="$(readlink -f "${BASH_SOURCE[0]}")"
+    SCRIPT_DIR="$(cd -P "$(dirname "$REAL_SCRIPT")" >/dev/null 2>&1 && pwd)"
+else
+    SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+fi
+
+# 如果仍然判定为 /usr/local/bin，且 /opt/vps-security-monitor 存在，则强制修正为 /opt/vps-security-monitor
+if [[ "$SCRIPT_DIR" == "/usr/local/bin"* ]] && [ -d "/opt/vps-security-monitor" ]; then
+    SCRIPT_DIR="/opt/vps-security-monitor"
+fi
+
 CONFIG_FILE="${SCRIPT_DIR}/config.json"
 GUARD_PY="${SCRIPT_DIR}/vps_security_guard.py"
 
@@ -39,13 +51,31 @@ get_status() {
     NGINX_STATUS="${RED}不存在${PLAIN}"
 
     if [ -f "${CONFIG_FILE}" ]; then
-        local token=$(python3 -c "import json; cfg=json.load(open('${CONFIG_FILE}')); print(cfg.get('telegram',{}).get('bot_token',''))" 2>/dev/null)
+        local token=$(python3 - "$CONFIG_FILE" << 'EOF'
+import sys, json
+try:
+    with open(sys.argv[1], 'r', encoding='utf-8') as f:
+        cfg = json.load(f)
+    print(cfg.get('telegram', {}).get('bot_token', ''))
+except Exception:
+    print('')
+EOF
+)
         if [[ -n "$token" && "$token" != *"YOUR_"* ]]; then
             TG_STATUS="${GREEN}已配置${PLAIN}"
         fi
 
-        local ngx_log=$(python3 -c "import json; cfg=json.load(open('${CONFIG_FILE}')); print(cfg.get('logs',{}).get('nginx_access_log',''))" 2>/dev/null)
-        if [ -f "$ngx_log" ]; then
+        local ngx_log=$(python3 - "$CONFIG_FILE" << 'EOF'
+import sys, json
+try:
+    with open(sys.argv[1], 'r', encoding='utf-8') as f:
+        cfg = json.load(f)
+    print(cfg.get('logs', {}).get('nginx_access_log', ''))
+except Exception:
+    print('')
+EOF
+)
+        if [ -n "$ngx_log" ] && [ -f "$ngx_log" ]; then
             NGINX_STATUS="${GREEN}正常${PLAIN} ($ngx_log)"
         fi
     fi
@@ -67,8 +97,26 @@ config_telegram() {
     echo -e "3. 搜索并私聊 ${YELLOW}@userinfobot${PLAIN} 获取你的数字 Chat ID"
     echo ""
 
-    local current_token=$(python3 -c "import json; cfg=json.load(open('${CONFIG_FILE}')); print(cfg.get('telegram',{}).get('bot_token',''))" 2>/dev/null)
-    local current_chat=$(python3 -c "import json; cfg=json.load(open('${CONFIG_FILE}')); print(cfg.get('telegram',{}).get('chat_id',''))" 2>/dev/null)
+    local current_token=$(python3 - "$CONFIG_FILE" << 'EOF'
+import sys, json
+try:
+    with open(sys.argv[1], 'r', encoding='utf-8') as f:
+        cfg = json.load(f)
+    print(cfg.get('telegram', {}).get('bot_token', ''))
+except Exception:
+    print('')
+EOF
+)
+    local current_chat=$(python3 - "$CONFIG_FILE" << 'EOF'
+import sys, json
+try:
+    with open(sys.argv[1], 'r', encoding='utf-8') as f:
+        cfg = json.load(f)
+    print(cfg.get('telegram', {}).get('chat_id', ''))
+except Exception:
+    print('')
+EOF
+)
 
     echo -e "当前 Bot Token: ${GREEN}${current_token}${PLAIN}"
     echo -e "当前 Chat ID  : ${GREEN}${current_chat}${PLAIN}"
@@ -78,17 +126,38 @@ config_telegram() {
     read -p "请输入新的 Chat ID (回车保持不变): " new_chat
 
     if [ -n "$new_token" ] || [ -n "$new_chat" ]; then
-        python3 - <<EOF
-import json
-cfg_path = "${CONFIG_FILE}"
-with open(cfg_path, 'r', encoding='utf-8') as f:
-    cfg = json.load(f)
-if "$new_token":
-    cfg.setdefault("telegram", {})["bot_token"] = "$new_token".strip()
-if "$new_chat":
-    cfg.setdefault("telegram", {})["chat_id"] = "$new_chat".strip()
+        python3 - "$new_token" "$new_chat" "$CONFIG_FILE" << 'EOF'
+import sys, json, os
+
+new_token = sys.argv[1].strip()
+new_chat = sys.argv[2].strip()
+cfg_path = sys.argv[3].strip()
+
+cfg = {}
+if os.path.exists(cfg_path):
+    try:
+        with open(cfg_path, 'r', encoding='utf-8') as f:
+            cfg = json.load(f)
+    except Exception:
+        cfg = {}
+
+if not cfg:
+    example_path = os.path.join(os.path.dirname(cfg_path), 'config.example.json')
+    if os.path.exists(example_path):
+        try:
+            with open(example_path, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+        except Exception:
+            pass
+
+if new_token:
+    cfg.setdefault("telegram", {})["bot_token"] = new_token
+if new_chat:
+    cfg.setdefault("telegram", {})["chat_id"] = new_chat
+
 with open(cfg_path, 'w', encoding='utf-8') as f:
     json.dump(cfg, f, ensure_ascii=False, indent=2)
+
 print("[+] 配置已保存！")
 EOF
     fi
@@ -110,12 +179,16 @@ config_paths() {
     echo -e "${CYAN}            配置受监控的登录/敏感后台路径            ${PLAIN}"
     echo -e "${CYAN}=====================================================${PLAIN}"
     echo -e "当前监控的登录接口路径 (发生 400/401/403 时计为登录失败/撞库)："
-    python3 - <<EOF
-import json
-cfg = json.load(open("${CONFIG_FILE}"))
-paths = cfg.get("security", {}).get("login_paths", [])
-for i, p in enumerate(paths, 1):
-    print(f"  [{i}] {p}")
+    python3 - "$CONFIG_FILE" << 'EOF'
+import sys, json
+try:
+    with open(sys.argv[1], 'r', encoding='utf-8') as f:
+        cfg = json.load(f)
+    paths = cfg.get("security", {}).get("login_paths", [])
+    for i, p in enumerate(paths, 1):
+        print(f"  [{i}] {p}")
+except Exception:
+    pass
 EOF
     echo ""
     echo -e "  ${YELLOW}1.${PLAIN} 添加新的登录监控路径"
@@ -128,42 +201,53 @@ EOF
         1)
             read -p "请输入要监控的路径 (如 /api/v1/auth/login): " p_add
             if [ -n "$p_add" ]; then
-                python3 - <<EOF
-import json
-cfg = json.load(open("${CONFIG_FILE}"))
+                python3 - "$p_add" "$CONFIG_FILE" << 'EOF'
+import sys, json
+p_add, cfg_path = sys.argv[1].strip(), sys.argv[2].strip()
+with open(cfg_path, 'r', encoding='utf-8') as f:
+    cfg = json.load(f)
 ps = cfg.setdefault("security", {}).setdefault("login_paths", [])
-if "$p_add" not in ps:
-    ps.append("$p_add")
-json.dump(cfg, open("${CONFIG_FILE}", "w"), ensure_ascii=False, indent=2)
-print("[+] 路径已添加: $p_add")
+if p_add not in ps:
+    ps.append(p_add)
+with open(cfg_path, 'w', encoding='utf-8') as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
+print(f"[+] 路径已添加: {p_add}")
 EOF
             fi
             ;;
         2)
             read -p "请输入要删除的路径序号: " del_idx
-            python3 - <<EOF
-import json
-cfg = json.load(open("${CONFIG_FILE}"))
+            python3 - "$del_idx" "$CONFIG_FILE" << 'EOF'
+import sys, json
+del_idx, cfg_path = sys.argv[1].strip(), sys.argv[2].strip()
+with open(cfg_path, 'r', encoding='utf-8') as f:
+    cfg = json.load(f)
 ps = cfg.get("security", {}).get("login_paths", [])
 try:
-    idx = int("$del_idx") - 1
+    idx = int(del_idx) - 1
     if 0 <= idx < len(ps):
         removed = ps.pop(idx)
-        json.dump(cfg, open("${CONFIG_FILE}", "w"), ensure_ascii=False, indent=2)
+        with open(cfg_path, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
         print(f"[+] 已删除: {removed}")
-except Exception as e:
-    print(f"[-] 序号无效")
+    else:
+        print("[-] 序号超出范围")
+except Exception:
+    print("[-] 序号无效")
 EOF
             ;;
         3)
             read -p "请输入域名 (如 gpt.isoziyuan.com): " s_domain
             read -p "请输入展示别名 (如 Sub2API 大模型后台): " s_name
             if [ -n "$s_domain" ] && [ -n "$s_name" ]; then
-                python3 - <<EOF
-import json
-cfg = json.load(open("${CONFIG_FILE}"))
-cfg.setdefault("sites", {})["$s_domain".strip()] = "$s_name".strip()
-json.dump(cfg, open("${CONFIG_FILE}", "w"), ensure_ascii=False, indent=2)
+                python3 - "$s_domain" "$s_name" "$CONFIG_FILE" << 'EOF'
+import sys, json
+s_dom, s_name, cfg_path = sys.argv[1].strip(), sys.argv[2].strip(), sys.argv[3].strip()
+with open(cfg_path, 'r', encoding='utf-8') as f:
+    cfg = json.load(f)
+cfg.setdefault("sites", {})[s_dom] = s_name
+with open(cfg_path, 'w', encoding='utf-8') as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
 print("[+] 站点映射已保存！")
 EOF
             fi
@@ -179,12 +263,16 @@ config_ssl() {
     echo -e "${CYAN}             配置 SSL 证书监控域名列表              ${PLAIN}"
     echo -e "${CYAN}=====================================================${PLAIN}"
     echo -e "当前监控的域名列表："
-    python3 - <<EOF
-import json
-cfg = json.load(open("${CONFIG_FILE}"))
-doms = cfg.get("ssl_domains", [])
-for i, d in enumerate(doms, 1):
-    print(f"  [{i}] {d}")
+    python3 - "$CONFIG_FILE" << 'EOF'
+import sys, json
+try:
+    with open(sys.argv[1], 'r', encoding='utf-8') as f:
+        cfg = json.load(f)
+    doms = cfg.get("ssl_domains", [])
+    for i, d in enumerate(doms, 1):
+        print(f"  [{i}] {d}")
+except Exception:
+    pass
 EOF
     echo ""
     echo -e "  ${YELLOW}1.${PLAIN} 添加监控域名"
@@ -197,40 +285,50 @@ EOF
         1)
             read -p "请输入域名 (如 gpt.isoziyuan.com): " dom_add
             if [ -n "$dom_add" ]; then
-                python3 - <<EOF
-import json
-cfg = json.load(open("${CONFIG_FILE}"))
+                python3 - "$dom_add" "$CONFIG_FILE" << 'EOF'
+import sys, json
+dom_add, cfg_path = sys.argv[1].strip(), sys.argv[2].strip()
+with open(cfg_path, 'r', encoding='utf-8') as f:
+    cfg = json.load(f)
 doms = cfg.setdefault("ssl_domains", [])
-if "$dom_add" not in doms:
-    doms.append("$dom_add".strip())
-json.dump(cfg, open("${CONFIG_FILE}", "w"), ensure_ascii=False, indent=2)
-print("[+] 域名已添加: $dom_add")
+if dom_add not in doms:
+    doms.append(dom_add)
+with open(cfg_path, 'w', encoding='utf-8') as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
+print(f"[+] 域名已添加: {dom_add}")
 EOF
             fi
             ;;
         2)
             read -p "请输入要删除的域名序号: " del_idx
-            python3 - <<EOF
-import json
-cfg = json.load(open("${CONFIG_FILE}"))
+            python3 - "$del_idx" "$CONFIG_FILE" << 'EOF'
+import sys, json
+del_idx, cfg_path = sys.argv[1].strip(), sys.argv[2].strip()
+with open(cfg_path, 'r', encoding='utf-8') as f:
+    cfg = json.load(f)
 doms = cfg.get("ssl_domains", [])
 try:
-    idx = int("$del_idx") - 1
+    idx = int(del_idx) - 1
     if 0 <= idx < len(doms):
         removed = doms.pop(idx)
-        json.dump(cfg, open("${CONFIG_FILE}", "w"), ensure_ascii=False, indent=2)
+        with open(cfg_path, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
         print(f"[+] 已删除: {removed}")
+    else:
+        print("[-] 序号超出范围")
 except Exception:
     print("[-] 序号无效")
 EOF
             ;;
         3)
             echo "正在连接检测 SSL 证书有效期..."
-            python3 - <<EOF
-import json, sys
-sys.path.insert(0, "${SCRIPT_DIR}")
+            python3 - "$CONFIG_FILE" "$SCRIPT_DIR" << 'EOF'
+import sys, json, os
+cfg_path, s_dir = sys.argv[1].strip(), sys.argv[2].strip()
+sys.path.insert(0, s_dir)
 import vps_security_guard as guard
-cfg = json.load(open("${CONFIG_FILE}"))
+with open(cfg_path, 'r', encoding='utf-8') as f:
+    cfg = json.load(f)
 for dom in cfg.get("ssl_domains", []):
     days = guard.check_ssl_expiry(dom)
     if days is not None:
@@ -250,12 +348,16 @@ config_ssh_whitelist() {
     echo -e "${CYAN}           配置 SSH 允许白名单 IP (陌生登录审计)     ${PLAIN}"
     echo -e "${CYAN}=====================================================${PLAIN}"
     echo -e "如果登录成功的 IP 不在以下列表中，安全日报将标红发出警告："
-    python3 - <<EOF
-import json
-cfg = json.load(open("${CONFIG_FILE}"))
-ips = cfg.get("security", {}).get("known_ssh_ips", [])
-for i, ip in enumerate(ips, 1):
-    print(f"  [{i}] {ip}")
+    python3 - "$CONFIG_FILE" << 'EOF'
+import sys, json
+try:
+    with open(sys.argv[1], 'r', encoding='utf-8') as f:
+        cfg = json.load(f)
+    ips = cfg.get("security", {}).get("known_ssh_ips", [])
+    for i, ip in enumerate(ips, 1):
+        print(f"  [{i}] {ip}")
+except Exception:
+    pass
 EOF
     echo ""
     echo -e "当前你登录本终端的 IP 是: ${GREEN}${SSH_CLIENT%% *}${PLAIN}"
@@ -270,43 +372,54 @@ EOF
         1)
             local my_ip="${SSH_CLIENT%% *}"
             if [ -n "$my_ip" ]; then
-                python3 - <<EOF
-import json
-cfg = json.load(open("${CONFIG_FILE}"))
+                python3 - "$my_ip" "$CONFIG_FILE" << 'EOF'
+import sys, json
+my_ip, cfg_path = sys.argv[1].strip(), sys.argv[2].strip()
+with open(cfg_path, 'r', encoding='utf-8') as f:
+    cfg = json.load(f)
 ips = cfg.setdefault("security", {}).setdefault("known_ssh_ips", [])
-if "$my_ip" not in ips:
-    ips.append("$my_ip")
-json.dump(cfg, open("${CONFIG_FILE}", "w"), ensure_ascii=False, indent=2)
-print("[+] 当前 IP 已加入白名单: $my_ip")
+if my_ip not in ips:
+    ips.append(my_ip)
+with open(cfg_path, 'w', encoding='utf-8') as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
+print(f"[+] 当前 IP 已加入白名单: {my_ip}")
 EOF
             fi
             ;;
         2)
             read -p "请输入 IP: " ip_add
             if [ -n "$ip_add" ]; then
-                python3 - <<EOF
-import json
-cfg = json.load(open("${CONFIG_FILE}"))
+                python3 - "$ip_add" "$CONFIG_FILE" << 'EOF'
+import sys, json
+ip_add, cfg_path = sys.argv[1].strip(), sys.argv[2].strip()
+with open(cfg_path, 'r', encoding='utf-8') as f:
+    cfg = json.load(f)
 ips = cfg.setdefault("security", {}).setdefault("known_ssh_ips", [])
-if "$ip_add" not in ips:
-    ips.append("$ip_add".strip())
-json.dump(cfg, open("${CONFIG_FILE}", "w"), ensure_ascii=False, indent=2)
-print("[+] IP 已加入白名单: $ip_add")
+if ip_add not in ips:
+    ips.append(ip_add)
+with open(cfg_path, 'w', encoding='utf-8') as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
+print(f"[+] IP 已加入白名单: {ip_add}")
 EOF
             fi
             ;;
         3)
             read -p "请输入要删除的序号: " del_idx
-            python3 - <<EOF
-import json
-cfg = json.load(open("${CONFIG_FILE}"))
+            python3 - "$del_idx" "$CONFIG_FILE" << 'EOF'
+import sys, json
+del_idx, cfg_path = sys.argv[1].strip(), sys.argv[2].strip()
+with open(cfg_path, 'r', encoding='utf-8') as f:
+    cfg = json.load(f)
 ips = cfg.get("security", {}).get("known_ssh_ips", [])
 try:
-    idx = int("$del_idx") - 1
+    idx = int(del_idx) - 1
     if 0 <= idx < len(ips):
         removed = ips.pop(idx)
-        json.dump(cfg, open("${CONFIG_FILE}", "w"), ensure_ascii=False, indent=2)
+        with open(cfg_path, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
         print(f"[+] 已删除: {removed}")
+    else:
+        print("[-] 序号超出范围")
 except Exception:
     print("[-] 序号无效")
 EOF
@@ -321,15 +434,19 @@ config_backup() {
     echo -e "${CYAN}=====================================================${PLAIN}"
     echo -e "${CYAN}               配置备份校验状态监控                 ${PLAIN}"
     echo -e "${CYAN}=====================================================${PLAIN}"
-    python3 - <<EOF
-import json
-cfg = json.load(open("${CONFIG_FILE}"))
-b = cfg.get("backup", {})
-print(f"启用状态: {b.get('enabled', False)}")
-print(f"存储标识: {b.get('name', 'R2')}")
-print(f"校验模式: {b.get('type', 'file')}")
-print(f"监控路径: {b.get('path', '')}")
-print(f"校验命令: {b.get('command', '')}")
+    python3 - "$CONFIG_FILE" << 'EOF'
+import sys, json
+try:
+    with open(sys.argv[1], 'r', encoding='utf-8') as f:
+        cfg = json.load(f)
+    b = cfg.get("backup", {})
+    print(f"启用状态: {b.get('enabled', False)}")
+    print(f"存储标识: {b.get('name', 'R2')}")
+    print(f"校验模式: {b.get('type', 'file')}")
+    print(f"监控路径: {b.get('path', '')}")
+    print(f"校验命令: {b.get('command', '')}")
+except Exception:
+    pass
 EOF
     echo ""
     echo -e "  ${YELLOW}1.${PLAIN} 启用/禁用备份状态展示"
@@ -340,12 +457,15 @@ EOF
     read -p "请选择操作 [0-3]: " opt
     case "$opt" in
         1)
-            python3 - <<EOF
-import json
-cfg = json.load(open("${CONFIG_FILE}"))
+            python3 - "$CONFIG_FILE" << 'EOF'
+import sys, json
+cfg_path = sys.argv[1].strip()
+with open(cfg_path, 'r', encoding='utf-8') as f:
+    cfg = json.load(f)
 b = cfg.setdefault("backup", {})
 b["enabled"] = not b.get("enabled", False)
-json.dump(cfg, open("${CONFIG_FILE}", "w"), ensure_ascii=False, indent=2)
+with open(cfg_path, 'w', encoding='utf-8') as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
 print(f"[+] 备份监控状态已切换为: {b['enabled']}")
 EOF
             ;;
@@ -353,15 +473,18 @@ EOF
             read -p "请输入本地备份文件所在目录路径 (如 /data/backups): " b_path
             read -p "请输入显示名称 (默认 R2): " b_name
             b_name=${b_name:-R2}
-            python3 - <<EOF
-import json
-cfg = json.load(open("${CONFIG_FILE}"))
+            python3 - "$b_path" "$b_name" "$CONFIG_FILE" << 'EOF'
+import sys, json
+b_path, b_name, cfg_path = sys.argv[1].strip(), sys.argv[2].strip(), sys.argv[3].strip()
+with open(cfg_path, 'r', encoding='utf-8') as f:
+    cfg = json.load(f)
 b = cfg.setdefault("backup", {})
 b["enabled"] = True
 b["type"] = "file"
-b["name"] = "$b_name"
-b["path"] = "$b_path".strip()
-json.dump(cfg, open("${CONFIG_FILE}", "w"), ensure_ascii=False, indent=2)
+b["name"] = b_name
+b["path"] = b_path
+with open(cfg_path, 'w', encoding='utf-8') as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
 print("[+] 本地备份路径配置已生效！")
 EOF
             ;;
@@ -369,15 +492,18 @@ EOF
             read -p "请输入自定义校验 Shell 命令: " b_cmd
             read -p "请输入显示名称 (默认 R2): " b_name
             b_name=${b_name:-R2}
-            python3 - <<EOF
-import json
-cfg = json.load(open("${CONFIG_FILE}"))
+            python3 - "$b_cmd" "$b_name" "$CONFIG_FILE" << 'EOF'
+import sys, json
+b_cmd, b_name, cfg_path = sys.argv[1].strip(), sys.argv[2].strip(), sys.argv[3].strip()
+with open(cfg_path, 'r', encoding='utf-8') as f:
+    cfg = json.load(f)
 b = cfg.setdefault("backup", {})
 b["enabled"] = True
 b["type"] = "command"
-b["name"] = "$b_name"
-b["command"] = "$b_cmd".strip()
-json.dump(cfg, open("${CONFIG_FILE}", "w"), ensure_ascii=False, indent=2)
+b["name"] = b_name
+b["command"] = b_cmd
+with open(cfg_path, 'w', encoding='utf-8') as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
 print("[+] 自定义命令配置已生效！")
 EOF
             ;;
@@ -398,9 +524,7 @@ install_crontab() {
     read -p "确认安装到当前用户的 Crontab 吗? (y/n) [y]: " confirm
     confirm=${confirm:-y}
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        # 先清除旧任务，避免重复
         crontab -l 2>/dev/null | grep -v "vps_security_guard.py" > /tmp/cron_temp.txt || true
-        # 写入新任务
         echo "*/5 * * * * /usr/bin/python3 ${GUARD_PY} check >/dev/null 2>&1" >> /tmp/cron_temp.txt
         echo "0 9 * * * /usr/bin/python3 ${GUARD_PY} daily >/dev/null 2>&1" >> /tmp/cron_temp.txt
         crontab /tmp/cron_temp.txt
@@ -447,16 +571,27 @@ diagnose_system() {
     echo -e "${CYAN}=====================================================${PLAIN}"
     echo -e "${CYAN}                 系统环境与日志自检                  ${PLAIN}"
     echo -e "${CYAN}=====================================================${PLAIN}"
-    echo -e "1. Python 环境: $(python3 --version 2>&1)"
-    echo -e "2. Nginx 日志检测:"
-    local ngx_log=$(python3 -c "import json; cfg=json.load(open('${CONFIG_FILE}')); print(cfg.get('logs',{}).get('nginx_access_log',''))" 2>/dev/null)
-    if [ -f "$ngx_log" ]; then
+    echo -e "1. 程序工作目录: ${GREEN}${SCRIPT_DIR}${PLAIN}"
+    echo -e "2. 配置文件路径: ${GREEN}${CONFIG_FILE}${PLAIN}"
+    echo -e "3. Python 环境: $(python3 --version 2>&1)"
+    echo -e "4. Nginx 日志检测:"
+    local ngx_log=$(python3 - "$CONFIG_FILE" << 'EOF'
+import sys, json
+try:
+    with open(sys.argv[1], 'r', encoding='utf-8') as f:
+        cfg = json.load(f)
+    print(cfg.get('logs', {}).get('nginx_access_log', ''))
+except Exception:
+    print('')
+EOF
+)
+    if [ -n "$ngx_log" ] && [ -f "$ngx_log" ]; then
         echo -e "   - 路径: ${GREEN}$ngx_log${PLAIN} (大小: $(du -sh $ngx_log | cut -f1))"
     else
         echo -e "   - 路径: ${RED}$ngx_log 不存在！${PLAIN} (请确认 Nginx 日志路径)"
     fi
 
-    echo -e "3. SSH 认证日志:"
+    echo -e "5. SSH 认证日志:"
     for f in /var/log/auth.log /var/log/secure; do
         if [ -f "$f" ]; then
             echo -e "   - 找到日志文件: ${GREEN}$f${PLAIN}"
@@ -466,7 +601,7 @@ diagnose_system() {
         echo -e "   - 支持 journalctl 读取 SSH 服务认证记录"
     fi
 
-    echo -e "4. Fail2ban 状态:"
+    echo -e "6. Fail2ban 状态:"
     if command -v fail2ban-client &>/dev/null; then
         echo -e "   - Fail2ban: ${GREEN}已安装${PLAIN}"
         fail2ban-client status 2>/dev/null | grep -E "Jail list" || echo "   - 服务未运行"
@@ -474,7 +609,7 @@ diagnose_system() {
         echo -e "   - Fail2ban: ${YELLOW}未安装 (不影响 Web/SSH/证书日志统计)${PLAIN}"
     fi
 
-    echo -e "5. 系统资源:"
+    echo -e "7. 系统资源:"
     df -h / | awk 'NR==2{print "   - 根分区已用: "$5" (可用 "$4")"}'
     free -m | awk 'NR==2{print "   - 内存可用: "$7" MB"}'
     echo ""

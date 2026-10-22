@@ -67,8 +67,11 @@ if [ ! -f "${INSTALL_DIR}/config.json" ]; then
     fi
 fi
 
-# 4. 创建全局快捷命令
-ln -sf "${INSTALL_DIR}/menu.sh" "${BIN_LINK}"
+# 4. 创建全局快捷命令 (使用直接调用包装器，确保环境与路径绝对可靠)
+cat << 'EOF' > "${BIN_LINK}"
+#!/usr/bin/env bash
+exec /opt/vps-security-monitor/menu.sh "$@"
+EOF
 chmod +x "${BIN_LINK}"
 
 echo -e "${GREEN}[+] 部署成功！${PLAIN}"
