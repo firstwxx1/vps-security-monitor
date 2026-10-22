@@ -1124,6 +1124,23 @@ class SecurityBot:
         elif data.startswith("act:ren_node:"):
             idx = int(data.split(":")[-1])
             self.prompt_rename_node(chat_id, idx, msg_id)
+        elif data.startswith("act:ren_to:"):
+            parts = data.split(":", 3)
+            idx = int(parts[2])
+            new_name = parts[3]
+            nodes = load_nodes()
+            if 0 <= idx < len(nodes):
+                old_name = nodes[idx].get("name")
+                nodes[idx]["name"] = new_name
+                save_nodes(nodes)
+                self.answer_callback(cb_id, f"✅ 已成功更名为: {new_name}")
+                self.send_msg(
+                    chat_id,
+                    f"✅ <b>[VPS 节点更名成功！]</b>\n"
+                    f"原名称: <code>{html_escape(old_name)}</code>\n"
+                    f"新名称: <b>{html_escape(new_name)}</b>"
+                )
+                self.show_nodes_menu(chat_id)
         elif data.startswith("act:del_node:"):
             idx = int(data.split(":")[-1])
             self.delete_node(chat_id, idx)
@@ -1167,13 +1184,79 @@ class SecurityBot:
             self.show_one_click_cmd(chat_id)
             return
 
-        # 处理快捷改名指令 /rename 序号 新名称 或 /rename IP 新名称
-        if text.startswith("/rename") or text.startswith("/name") or text.startswith("改名"):
-            parts = text.split(maxsplit=2)
-            if len(parts) >= 3:
+        # 4. 改名指令与交互 (/rename)
+        cmd_word = text.split()[0].lower() if text.strip() else ""
+        is_rename_cmd = cmd_word in ("/rename", "/name", "改名") or cmd_word.startswith("/rename@") or cmd_word.startswith("/name@")
+
+        if is_rename_cmd:
+            parts = text.strip().split(maxsplit=2)
+            nodes = load_nodes()
+
+            # Case A: 用户仅发送了 /rename (例如点击了菜单里的 /rename)
+            if len(parts) == 1:
+                btn_rows = []
+                for idx, n in enumerate(nodes):
+                    n_name = n.get("name", "未命名")
+                    btn_rows.append([
+                        {"text": f"✏️ {idx + 1}. {n_name}", "callback_data": f"act:ren_node:{idx}"}
+                    ])
+                btn_rows.append([{"text": "🔙 返回节点列表", "callback_data": "nav:nodes"}])
+                self.send_msg(
+                    chat_id,
+                    "✏️ <b>请点击选择要修改名称的 VPS 节点：</b>\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    "💡 <i>点击对应节点后，直接在聊天窗口输入新名字即可！</i>",
+                    reply_markup={"inline_keyboard": btn_rows}
+                )
+                return
+
+            # Case B: 用户发送了 2 个参数，例如: /rename 2 或 /rename 日本vpn
+            elif len(parts) == 2:
+                arg = parts[1].strip()
+                if arg.isdigit() and 1 <= int(arg) <= len(nodes):
+                    target_idx = int(arg) - 1
+                    self.prompt_rename_node(chat_id, target_idx)
+                    return
+
+                ip_match_idx = next((i for i, n in enumerate(nodes) if n.get("host") == arg), None)
+                if ip_match_idx is not None:
+                    self.prompt_rename_node(chat_id, ip_match_idx)
+                    return
+
+                # 若当前共 2 台机器（1台本机 + 1台远程），且参数不是序号，直接推断用户要给第 2 台机器改名为该参数
+                if len(nodes) == 2:
+                    new_name = arg
+                    target_idx = 1
+                    old_name = nodes[target_idx].get("name")
+                    nodes[target_idx]["name"] = new_name
+                    save_nodes(nodes)
+                    self.send_msg(
+                        chat_id,
+                        f"✅ <b>[VPS 节点更名成功！]</b>\n"
+                        f"原名称: <code>{html_escape(old_name)}</code>\n"
+                        f"新名称: <b>{html_escape(new_name)}</b>"
+                    )
+                    self.show_nodes_menu(chat_id)
+                    return
+                else:
+                    btn_rows = []
+                    for idx, n in enumerate(nodes):
+                        n_name = n.get("name", "未命名")
+                        btn_rows.append([
+                            {"text": f"✏️ 将【{n_name}】改名为 {arg}", "callback_data": f"act:ren_to:{idx}:{arg}"}
+                        ])
+                    btn_rows.append([{"text": "🔙 返回节点列表", "callback_data": "nav:nodes"}])
+                    self.send_msg(
+                        chat_id,
+                        f"❓ 请问你想把哪台 VPS 重命名为 <b>{html_escape(arg)}</b>？",
+                        reply_markup={"inline_keyboard": btn_rows}
+                    )
+                    return
+
+            # Case C: 用户发送了 3 个参数，例如: /rename 2 日本vpn 或 /rename 8.209.239.164 阿里云
+            else:
                 target_ident = parts[1].strip()
                 new_name = parts[2].strip()
-                nodes = load_nodes()
                 found_idx = None
                 if target_ident.isdigit():
                     idx = int(target_ident) - 1
@@ -1184,11 +1267,10 @@ class SecurityBot:
                         if n.get("host") == target_ident or target_ident in n.get("name", ""):
                             found_idx = i
                             break
+
                 if found_idx is not None:
                     old_name = nodes[found_idx].get("name")
-                    host = nodes[found_idx].get("host", "")
-                    display_name = f"{new_name} ({host})" if (host and host not in new_name and not nodes[found_idx].get("is_local")) else new_name
-                    nodes[found_idx]["name"] = display_name
+                    nodes[found_idx]["name"] = new_name
                     save_nodes(nodes)
                     if nodes[found_idx].get("is_local"):
                         try:
@@ -1198,17 +1280,19 @@ class SecurityBot:
                                 json.dump(cfg, f, ensure_ascii=False, indent=2)
                         except Exception:
                             pass
-                    self.send_msg(chat_id, f"✅ <b>节点已成功更名为</b>: <code>{html_escape(display_name)}</code>")
+                    self.send_msg(
+                        chat_id,
+                        f"✅ <b>[VPS 节点更名成功！]</b>\n"
+                        f"原名称: <code>{html_escape(old_name)}</code>\n"
+                        f"新名称: <b>{html_escape(new_name)}</b>"
+                    )
                     self.show_nodes_menu(chat_id)
                     return
                 else:
-                    self.send_msg(chat_id, f"❌ 未找到匹配的节点: <code>{html_escape(target_ident)}</code>")
+                    self.send_msg(chat_id, f"❌ 未找到匹配的节点: <code>{html_escape(target_ident)}</code>\n发送 /nodes 可查看当前节点列表与序号。")
                     return
-            else:
-                self.send_msg(chat_id, "💡 <b>改名指令用法</b>:\n<code>/rename 序号 新名称</code>\n例如: <code>/rename 2 阿里云香港</code>")
-                return
 
-        # 如果处于等待改名状态
+        # 如果处于等待改名状态 (点击了改名按钮后直接回复文字)
         if current_state == "waiting_rename_node":
             idx = state_data.get("node_idx")
             new_name = text.strip()
@@ -1222,9 +1306,7 @@ class SecurityBot:
             nodes = load_nodes()
             if idx is not None and 0 <= idx < len(nodes):
                 old_name = nodes[idx].get("name")
-                host = nodes[idx].get("host", "")
-                display_name = f"{new_name} ({host})" if (host and host not in new_name and not nodes[idx].get("is_local")) else new_name
-                nodes[idx]["name"] = display_name
+                nodes[idx]["name"] = new_name
                 save_nodes(nodes)
 
                 if nodes[idx].get("is_local"):
@@ -1240,7 +1322,7 @@ class SecurityBot:
                     chat_id,
                     f"✅ <b>[VPS 节点更名成功！]</b>\n"
                     f"原名称: <code>{html_escape(old_name)}</code>\n"
-                    f"新名称: <b>{html_escape(display_name)}</b>"
+                    f"新名称: <b>{html_escape(new_name)}</b>"
                 )
                 self.show_nodes_menu(chat_id)
             else:
