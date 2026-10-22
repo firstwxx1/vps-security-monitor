@@ -1,5 +1,6 @@
 # 忽略私密配置文件与运行状态文件
 config.json
+nodes.json
 monitor_state.json
 ip_geo_cache.json
 *.log
