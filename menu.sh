@@ -1,0 +1,530 @@
+#!/usr/bin/env bash
+# =======================================================
+# VPS 安全巡检与监控终端管理面板
+# =======================================================
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+PLAIN='\033[0m'
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${SCRIPT_DIR}/config.json"
+GUARD_PY="${SCRIPT_DIR}/vps_security_guard.py"
+
+# 检查 Python3
+check_python() {
+    if ! command -v python3 &>/dev/null; then
+        echo -e "${RED}[错误] 未检测到 python3，请先安装: apt update && apt install -y python3 或 yum install -y python3${PLAIN}"
+        exit 1
+    fi
+}
+
+# 确保 config.json 存在
+init_config() {
+    if [ ! -f "${CONFIG_FILE}" ]; then
+        if [ -f "${SCRIPT_DIR}/config.example.json" ]; then
+            cp "${SCRIPT_DIR}/config.example.json" "${CONFIG_FILE}"
+        fi
+    fi
+}
+
+# 读取配置状态
+get_status() {
+    TG_STATUS="${RED}未配置${PLAIN}"
+    CRON_STATUS="${RED}未安装${PLAIN}"
+    NGINX_STATUS="${RED}不存在${PLAIN}"
+
+    if [ -f "${CONFIG_FILE}" ]; then
+        local token=$(python3 -c "import json; cfg=json.load(open('${CONFIG_FILE}')); print(cfg.get('telegram',{}).get('bot_token',''))" 2>/dev/null)
+        if [[ -n "$token" && "$token" != *"YOUR_"* ]]; then
+            TG_STATUS="${GREEN}已配置${PLAIN}"
+        fi
+
+        local ngx_log=$(python3 -c "import json; cfg=json.load(open('${CONFIG_FILE}')); print(cfg.get('logs',{}).get('nginx_access_log',''))" 2>/dev/null)
+        if [ -f "$ngx_log" ]; then
+            NGINX_STATUS="${GREEN}正常${PLAIN} ($ngx_log)"
+        fi
+    fi
+
+    if crontab -l 2>/dev/null | grep -q "vps_security_guard.py"; then
+        CRON_STATUS="${GREEN}已激活${PLAIN}"
+    fi
+}
+
+# 1. 配置 Telegram
+config_telegram() {
+    clear
+    echo -e "${CYAN}=====================================================${PLAIN}"
+    echo -e "${CYAN}             配置 Telegram 报警通知机器人            ${PLAIN}"
+    echo -e "${CYAN}=====================================================${PLAIN}"
+    echo -e "说明："
+    echo -e "1. 在 Telegram 搜索并私聊 ${YELLOW}@BotFather${PLAIN}，发送 /newbot 创建机器人获取 Token"
+    echo -e "2. 私聊你的新 Bot 随便发一条消息激活对话"
+    echo -e "3. 搜索并私聊 ${YELLOW}@userinfobot${PLAIN} 获取你的数字 Chat ID"
+    echo ""
+
+    local current_token=$(python3 -c "import json; cfg=json.load(open('${CONFIG_FILE}')); print(cfg.get('telegram',{}).get('bot_token',''))" 2>/dev/null)
+    local current_chat=$(python3 -c "import json; cfg=json.load(open('${CONFIG_FILE}')); print(cfg.get('telegram',{}).get('chat_id',''))" 2>/dev/null)
+
+    echo -e "当前 Bot Token: ${GREEN}${current_token}${PLAIN}"
+    echo -e "当前 Chat ID  : ${GREEN}${current_chat}${PLAIN}"
+    echo ""
+
+    read -p "请输入新的 Bot Token (回车保持不变): " new_token
+    read -p "请输入新的 Chat ID (回车保持不变): " new_chat
+
+    if [ -n "$new_token" ] || [ -n "$new_chat" ]; then
+        python3 - <<EOF
+import json
+cfg_path = "${CONFIG_FILE}"
+with open(cfg_path, 'r', encoding='utf-8') as f:
+    cfg = json.load(f)
+if "$new_token":
+    cfg.setdefault("telegram", {})["bot_token"] = "$new_token".strip()
+if "$new_chat":
+    cfg.setdefault("telegram", {})["chat_id"] = "$new_chat".strip()
+with open(cfg_path, 'w', encoding='utf-8') as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
+print("[+] 配置已保存！")
+EOF
+    fi
+
+    echo ""
+    read -p "是否立即发送测试消息到 Telegram? (y/n) [y]: " send_test
+    send_test=${send_test:-y}
+    if [[ "$send_test" =~ ^[Yy]$ ]]; then
+        python3 "${GUARD_PY}" test
+    fi
+    echo ""
+    read -n 1 -s -r -p "按任意键返回主菜单..."
+}
+
+# 2. 配置敏感后台与监控路径
+config_paths() {
+    clear
+    echo -e "${CYAN}=====================================================${PLAIN}"
+    echo -e "${CYAN}            配置受监控的登录/敏感后台路径            ${PLAIN}"
+    echo -e "${CYAN}=====================================================${PLAIN}"
+    echo -e "当前监控的登录接口路径 (发生 400/401/403 时计为登录失败/撞库)："
+    python3 - <<EOF
+import json
+cfg = json.load(open("${CONFIG_FILE}"))
+paths = cfg.get("security", {}).get("login_paths", [])
+for i, p in enumerate(paths, 1):
+    print(f"  [{i}] {p}")
+EOF
+    echo ""
+    echo -e "  ${YELLOW}1.${PLAIN} 添加新的登录监控路径"
+    echo -e "  ${YELLOW}2.${PLAIN} 删除已有监控路径"
+    echo -e "  ${YELLOW}3.${PLAIN} 配置站点友好别名 (如 gpt.isoziyuan.com -> Sub2API 大模型后台)"
+    echo -e "  ${YELLOW}0.${PLAIN} 返回上一级"
+    echo ""
+    read -p "请选择操作 [0-3]: " opt
+    case "$opt" in
+        1)
+            read -p "请输入要监控的路径 (如 /api/v1/auth/login): " p_add
+            if [ -n "$p_add" ]; then
+                python3 - <<EOF
+import json
+cfg = json.load(open("${CONFIG_FILE}"))
+ps = cfg.setdefault("security", {}).setdefault("login_paths", [])
+if "$p_add" not in ps:
+    ps.append("$p_add")
+json.dump(cfg, open("${CONFIG_FILE}", "w"), ensure_ascii=False, indent=2)
+print("[+] 路径已添加: $p_add")
+EOF
+            fi
+            ;;
+        2)
+            read -p "请输入要删除的路径序号: " del_idx
+            python3 - <<EOF
+import json
+cfg = json.load(open("${CONFIG_FILE}"))
+ps = cfg.get("security", {}).get("login_paths", [])
+try:
+    idx = int("$del_idx") - 1
+    if 0 <= idx < len(ps):
+        removed = ps.pop(idx)
+        json.dump(cfg, open("${CONFIG_FILE}", "w"), ensure_ascii=False, indent=2)
+        print(f"[+] 已删除: {removed}")
+except Exception as e:
+    print(f"[-] 序号无效")
+EOF
+            ;;
+        3)
+            read -p "请输入域名 (如 gpt.isoziyuan.com): " s_domain
+            read -p "请输入展示别名 (如 Sub2API 大模型后台): " s_name
+            if [ -n "$s_domain" ] && [ -n "$s_name" ]; then
+                python3 - <<EOF
+import json
+cfg = json.load(open("${CONFIG_FILE}"))
+cfg.setdefault("sites", {})["$s_domain".strip()] = "$s_name".strip()
+json.dump(cfg, open("${CONFIG_FILE}", "w"), ensure_ascii=False, indent=2)
+print("[+] 站点映射已保存！")
+EOF
+            fi
+            ;;
+    esac
+    read -n 1 -s -r -p "按任意键返回..."
+}
+
+# 3. 配置 SSL 证书监测域名
+config_ssl() {
+    clear
+    echo -e "${CYAN}=====================================================${PLAIN}"
+    echo -e "${CYAN}             配置 SSL 证书监控域名列表              ${PLAIN}"
+    echo -e "${CYAN}=====================================================${PLAIN}"
+    echo -e "当前监控的域名列表："
+    python3 - <<EOF
+import json
+cfg = json.load(open("${CONFIG_FILE}"))
+doms = cfg.get("ssl_domains", [])
+for i, d in enumerate(doms, 1):
+    print(f"  [{i}] {d}")
+EOF
+    echo ""
+    echo -e "  ${YELLOW}1.${PLAIN} 添加监控域名"
+    echo -e "  ${YELLOW}2.${PLAIN} 删除监控域名"
+    echo -e "  ${YELLOW}3.${PLAIN} 立即检测各域名剩余天数"
+    echo -e "  ${YELLOW}0.${PLAIN} 返回上一级"
+    echo ""
+    read -p "请选择操作 [0-3]: " opt
+    case "$opt" in
+        1)
+            read -p "请输入域名 (如 gpt.isoziyuan.com): " dom_add
+            if [ -n "$dom_add" ]; then
+                python3 - <<EOF
+import json
+cfg = json.load(open("${CONFIG_FILE}"))
+doms = cfg.setdefault("ssl_domains", [])
+if "$dom_add" not in doms:
+    doms.append("$dom_add".strip())
+json.dump(cfg, open("${CONFIG_FILE}", "w"), ensure_ascii=False, indent=2)
+print("[+] 域名已添加: $dom_add")
+EOF
+            fi
+            ;;
+        2)
+            read -p "请输入要删除的域名序号: " del_idx
+            python3 - <<EOF
+import json
+cfg = json.load(open("${CONFIG_FILE}"))
+doms = cfg.get("ssl_domains", [])
+try:
+    idx = int("$del_idx") - 1
+    if 0 <= idx < len(doms):
+        removed = doms.pop(idx)
+        json.dump(cfg, open("${CONFIG_FILE}", "w"), ensure_ascii=False, indent=2)
+        print(f"[+] 已删除: {removed}")
+except Exception:
+    print("[-] 序号无效")
+EOF
+            ;;
+        3)
+            echo "正在连接检测 SSL 证书有效期..."
+            python3 - <<EOF
+import json, sys
+sys.path.insert(0, "${SCRIPT_DIR}")
+import vps_security_guard as guard
+cfg = json.load(open("${CONFIG_FILE}"))
+for dom in cfg.get("ssl_domains", []):
+    days = guard.check_ssl_expiry(dom)
+    if days is not None:
+        print(f"  {dom} -> 剩余 {days} 天")
+    else:
+        print(f"  {dom} -> 探测失败/无法连接 443")
+EOF
+            ;;
+    esac
+    read -n 1 -s -r -p "按任意键返回..."
+}
+
+# 4. 配置 SSH 安全白名单
+config_ssh_whitelist() {
+    clear
+    echo -e "${CYAN}=====================================================${PLAIN}"
+    echo -e "${CYAN}           配置 SSH 允许白名单 IP (陌生登录审计)     ${PLAIN}"
+    echo -e "${CYAN}=====================================================${PLAIN}"
+    echo -e "如果登录成功的 IP 不在以下列表中，安全日报将标红发出警告："
+    python3 - <<EOF
+import json
+cfg = json.load(open("${CONFIG_FILE}"))
+ips = cfg.get("security", {}).get("known_ssh_ips", [])
+for i, ip in enumerate(ips, 1):
+    print(f"  [{i}] {ip}")
+EOF
+    echo ""
+    echo -e "当前你登录本终端的 IP 是: ${GREEN}${SSH_CLIENT%% *}${PLAIN}"
+    echo ""
+    echo -e "  ${YELLOW}1.${PLAIN} 将当前登录 IP 加入白名单"
+    echo -e "  ${YELLOW}2.${PLAIN} 手动输入 IP 加入白名单"
+    echo -e "  ${YELLOW}3.${PLAIN} 删除白名单 IP"
+    echo -e "  ${YELLOW}0.${PLAIN} 返回上一级"
+    echo ""
+    read -p "请选择操作 [0-3]: " opt
+    case "$opt" in
+        1)
+            local my_ip="${SSH_CLIENT%% *}"
+            if [ -n "$my_ip" ]; then
+                python3 - <<EOF
+import json
+cfg = json.load(open("${CONFIG_FILE}"))
+ips = cfg.setdefault("security", {}).setdefault("known_ssh_ips", [])
+if "$my_ip" not in ips:
+    ips.append("$my_ip")
+json.dump(cfg, open("${CONFIG_FILE}", "w"), ensure_ascii=False, indent=2)
+print("[+] 当前 IP 已加入白名单: $my_ip")
+EOF
+            fi
+            ;;
+        2)
+            read -p "请输入 IP: " ip_add
+            if [ -n "$ip_add" ]; then
+                python3 - <<EOF
+import json
+cfg = json.load(open("${CONFIG_FILE}"))
+ips = cfg.setdefault("security", {}).setdefault("known_ssh_ips", [])
+if "$ip_add" not in ips:
+    ips.append("$ip_add".strip())
+json.dump(cfg, open("${CONFIG_FILE}", "w"), ensure_ascii=False, indent=2)
+print("[+] IP 已加入白名单: $ip_add")
+EOF
+            fi
+            ;;
+        3)
+            read -p "请输入要删除的序号: " del_idx
+            python3 - <<EOF
+import json
+cfg = json.load(open("${CONFIG_FILE}"))
+ips = cfg.get("security", {}).get("known_ssh_ips", [])
+try:
+    idx = int("$del_idx") - 1
+    if 0 <= idx < len(ips):
+        removed = ips.pop(idx)
+        json.dump(cfg, open("${CONFIG_FILE}", "w"), ensure_ascii=False, indent=2)
+        print(f"[+] 已删除: {removed}")
+except Exception:
+    print("[-] 序号无效")
+EOF
+            ;;
+    esac
+    read -n 1 -s -r -p "按任意键返回..."
+}
+
+# 5. 配置备份监控
+config_backup() {
+    clear
+    echo -e "${CYAN}=====================================================${PLAIN}"
+    echo -e "${CYAN}               配置备份校验状态监控                 ${PLAIN}"
+    echo -e "${CYAN}=====================================================${PLAIN}"
+    python3 - <<EOF
+import json
+cfg = json.load(open("${CONFIG_FILE}"))
+b = cfg.get("backup", {})
+print(f"启用状态: {b.get('enabled', False)}")
+print(f"存储标识: {b.get('name', 'R2')}")
+print(f"校验模式: {b.get('type', 'file')}")
+print(f"监控路径: {b.get('path', '')}")
+print(f"校验命令: {b.get('command', '')}")
+EOF
+    echo ""
+    echo -e "  ${YELLOW}1.${PLAIN} 启用/禁用备份状态展示"
+    echo -e "  ${YELLOW}2.${PLAIN} 设置本地备份目录路径 (自动按最新文件时间校验)"
+    echo -e "  ${YELLOW}3.${PLAIN} 设置自定义校验命令 (如 rclone/脚本检测)"
+    echo -e "  ${YELLOW}0.${PLAIN} 返回上一级"
+    echo ""
+    read -p "请选择操作 [0-3]: " opt
+    case "$opt" in
+        1)
+            python3 - <<EOF
+import json
+cfg = json.load(open("${CONFIG_FILE}"))
+b = cfg.setdefault("backup", {})
+b["enabled"] = not b.get("enabled", False)
+json.dump(cfg, open("${CONFIG_FILE}", "w"), ensure_ascii=False, indent=2)
+print(f"[+] 备份监控状态已切换为: {b['enabled']}")
+EOF
+            ;;
+        2)
+            read -p "请输入本地备份文件所在目录路径 (如 /data/backups): " b_path
+            read -p "请输入显示名称 (默认 R2): " b_name
+            b_name=${b_name:-R2}
+            python3 - <<EOF
+import json
+cfg = json.load(open("${CONFIG_FILE}"))
+b = cfg.setdefault("backup", {})
+b["enabled"] = True
+b["type"] = "file"
+b["name"] = "$b_name"
+b["path"] = "$b_path".strip()
+json.dump(cfg, open("${CONFIG_FILE}", "w"), ensure_ascii=False, indent=2)
+print("[+] 本地备份路径配置已生效！")
+EOF
+            ;;
+        3)
+            read -p "请输入自定义校验 Shell 命令: " b_cmd
+            read -p "请输入显示名称 (默认 R2): " b_name
+            b_name=${b_name:-R2}
+            python3 - <<EOF
+import json
+cfg = json.load(open("${CONFIG_FILE}"))
+b = cfg.setdefault("backup", {})
+b["enabled"] = True
+b["type"] = "command"
+b["name"] = "$b_name"
+b["command"] = "$b_cmd".strip()
+json.dump(cfg, open("${CONFIG_FILE}", "w"), ensure_ascii=False, indent=2)
+print("[+] 自定义命令配置已生效！")
+EOF
+            ;;
+    esac
+    read -n 1 -s -r -p "按任意键返回..."
+}
+
+# 6. 一键安装 Crontab 定时任务
+install_crontab() {
+    clear
+    echo -e "${CYAN}=====================================================${PLAIN}"
+    echo -e "${CYAN}             一键配置 Crontab 巡检任务               ${PLAIN}"
+    echo -e "${CYAN}=====================================================${PLAIN}"
+    echo -e "即将添加的计划任务："
+    echo -e "  1. ${GREEN}*/5 * * * *${PLAIN} 突发拦截增量检测 (每 5 分钟扫描一次新攻击)"
+    echo -e "  2. ${GREEN}0 9 * * *${PLAIN}   每日安全日报 (每天早晨 09:00 推送全天汇总)"
+    echo ""
+    read -p "确认安装到当前用户的 Crontab 吗? (y/n) [y]: " confirm
+    confirm=${confirm:-y}
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        # 先清除旧任务，避免重复
+        crontab -l 2>/dev/null | grep -v "vps_security_guard.py" > /tmp/cron_temp.txt || true
+        # 写入新任务
+        echo "*/5 * * * * /usr/bin/python3 ${GUARD_PY} check >/dev/null 2>&1" >> /tmp/cron_temp.txt
+        echo "0 9 * * * /usr/bin/python3 ${GUARD_PY} daily >/dev/null 2>&1" >> /tmp/cron_temp.txt
+        crontab /tmp/cron_temp.txt
+        rm -f /tmp/cron_temp.txt
+        echo -e "${GREEN}[+] 定时任务安装成功！${PLAIN}"
+    fi
+    echo ""
+    read -n 1 -s -r -p "按任意键返回主菜单..."
+}
+
+# 7. 一键卸载 Crontab 定时任务
+uninstall_crontab() {
+    clear
+    echo -e "${YELLOW}正在清理 crontab 中的监控定时任务...${PLAIN}"
+    crontab -l 2>/dev/null | grep -v "vps_security_guard.py" > /tmp/cron_temp.txt || true
+    crontab /tmp/cron_temp.txt
+    rm -f /tmp/cron_temp.txt
+    echo -e "${GREEN}[+] 监控定时任务已全部移除！${PLAIN}"
+    read -n 1 -s -r -p "按任意键返回主菜单..."
+}
+
+# 8. 立即手动执行检测
+run_manual_check() {
+    clear
+    echo -e "${CYAN}正在执行增量突发检测 (check 模式)...${PLAIN}"
+    echo -e "${YELLOW}提示: 如果最近 5 分钟内没有达到阈值 (>=5次失败) 的集中爆破，不会触发通知。${PLAIN}"
+    python3 "${GUARD_PY}" check
+    echo -e "${GREEN}[+] 检测完成！${PLAIN}"
+    read -n 1 -s -r -p "按任意键返回主菜单..."
+}
+
+# 9. 立即生成全天安全日报
+run_manual_daily() {
+    clear
+    echo -e "${CYAN}正在汇总过去 24 小时数据并生成安全日报 (daily 模式)...${PLAIN}"
+    python3 "${GUARD_PY}" daily
+    echo -e "${GREEN}[+] 日报已生成并推送到 Telegram！${PLAIN}"
+    read -n 1 -s -r -p "按任意键返回主菜单..."
+}
+
+# 10. 系统环境与日志探测排查
+diagnose_system() {
+    clear
+    echo -e "${CYAN}=====================================================${PLAIN}"
+    echo -e "${CYAN}                 系统环境与日志自检                  ${PLAIN}"
+    echo -e "${CYAN}=====================================================${PLAIN}"
+    echo -e "1. Python 环境: $(python3 --version 2>&1)"
+    echo -e "2. Nginx 日志检测:"
+    local ngx_log=$(python3 -c "import json; cfg=json.load(open('${CONFIG_FILE}')); print(cfg.get('logs',{}).get('nginx_access_log',''))" 2>/dev/null)
+    if [ -f "$ngx_log" ]; then
+        echo -e "   - 路径: ${GREEN}$ngx_log${PLAIN} (大小: $(du -sh $ngx_log | cut -f1))"
+    else
+        echo -e "   - 路径: ${RED}$ngx_log 不存在！${PLAIN} (请确认 Nginx 日志路径)"
+    fi
+
+    echo -e "3. SSH 认证日志:"
+    for f in /var/log/auth.log /var/log/secure; do
+        if [ -f "$f" ]; then
+            echo -e "   - 找到日志文件: ${GREEN}$f${PLAIN}"
+        fi
+    done
+    if command -v journalctl &>/dev/null; then
+        echo -e "   - 支持 journalctl 读取 SSH 服务认证记录"
+    fi
+
+    echo -e "4. Fail2ban 状态:"
+    if command -v fail2ban-client &>/dev/null; then
+        echo -e "   - Fail2ban: ${GREEN}已安装${PLAIN}"
+        fail2ban-client status 2>/dev/null | grep -E "Jail list" || echo "   - 服务未运行"
+    else
+        echo -e "   - Fail2ban: ${YELLOW}未安装 (不影响 Web/SSH/证书日志统计)${PLAIN}"
+    fi
+
+    echo -e "5. 系统资源:"
+    df -h / | awk 'NR==2{print "   - 根分区已用: "$5" (可用 "$4")"}'
+    free -m | awk 'NR==2{print "   - 内存可用: "$7" MB"}'
+    echo ""
+    read -n 1 -s -r -p "按任意键返回主菜单..."
+}
+
+# 主菜单循环
+main_menu() {
+    check_python
+    init_config
+
+    while true; do
+        clear
+        get_status
+        echo -e "${PURPLE}=====================================================${PLAIN}"
+        echo -e "${PURPLE}         🛡️  VPS 安全巡检与监控终端管理面板          ${PLAIN}"
+        echo -e "${PURPLE}=====================================================${PLAIN}"
+        echo -e " 机器人通知 : ${TG_STATUS}   Crontab 定时 : ${CRON_STATUS}"
+        echo -e " Nginx 日志 : ${NGINX_STATUS}"
+        echo -e "${PURPLE}-----------------------------------------------------${PLAIN}"
+        echo -e " ${GREEN}1.${PLAIN} 配置 Telegram 报警通知机器人 (Token / Chat ID)"
+        echo -e " ${GREEN}2.${PLAIN} 配置受监控的登录/敏感后台路径 (如 /api/v1/auth/login)"
+        echo -e " ${GREEN}3.${PLAIN} 配置 SSL 证书监控域名列表"
+        echo -e " ${GREEN}4.${PLAIN} 配置 SSH 允许白名单 IP (陌生登录审计)"
+        echo -e " ${GREEN}5.${PLAIN} 配置备份校验状态 (R2 / 本地目录 / 自定义命令)"
+        echo -e "${PURPLE}-----------------------------------------------------${PLAIN}"
+        echo -e " ${CYAN}6.${PLAIN} 立即执行：突发攻击增量检测 (check)"
+        echo -e " ${CYAN}7.${PLAIN} 立即生成：全天安全日报 (daily)"
+        echo -e " ${CYAN}8.${PLAIN} 一键安装 / 更新 Crontab 定时任务"
+        echo -e " ${CYAN}9.${PLAIN} 一键卸载 Crontab 定时任务"
+        echo -e " ${CYAN}10.${PLAIN} 系统环境与日志排查自检"
+        echo -e "${PURPLE}-----------------------------------------------------${PLAIN}"
+        echo -e " ${YELLOW}0.${PLAIN} 退出管理菜单"
+        echo -e "${PURPLE}=====================================================${PLAIN}"
+        read -p "请输入选项 [0-10]: " choice
+        case "$choice" in
+            1) config_telegram ;;
+            2) config_paths ;;
+            3) config_ssl ;;
+            4) config_ssh_whitelist ;;
+            5) config_backup ;;
+            6) run_manual_check ;;
+            7) run_manual_daily ;;
+            8) install_crontab ;;
+            9) uninstall_crontab ;;
+            10) diagnose_system ;;
+            0) clear; exit 0 ;;
+            *) echo -e "${RED}输入无效，请重新输入！${PLAIN}"; sleep 1 ;;
+        esac
+    done
+}
+
+main_menu

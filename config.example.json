@@ -1,0 +1,38 @@
+{
+  "telegram": {
+    "bot_token": "YOUR_TELEGRAM_BOT_TOKEN",
+    "chat_id": "YOUR_TELEGRAM_CHAT_ID"
+  },
+  "logs": {
+    "nginx_access_log": "/var/log/nginx/access.log"
+  },
+  "sites": {
+    "gpt.isoziyuan.com": "Sub2API 大模型后台",
+    "teyir.com": "Teyir 主站",
+    "sms.teyir.com": "SMS 服务平台"
+  },
+  "security": {
+    "login_paths": [
+      "/api/v1/auth/login",
+      "/wp-login.php",
+      "/admin/login",
+      "/login",
+      "/api/auth",
+      "/user/login"
+    ],
+    "known_ssh_ips": [
+      "127.0.0.1"
+    ],
+    "alert_threshold_failures": 5
+  },
+  "ssl_domains": [
+    "gpt.isoziyuan.com",
+    "tsc.ailxw.com"
+  ],
+  "backup": {
+    "enabled": true,
+    "name": "R2",
+    "type": "command",
+    "command": "echo '已校验 0261021-193047'"
+  }
+}

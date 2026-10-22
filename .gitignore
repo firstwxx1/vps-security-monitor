@@ -1,0 +1,8 @@
+# 忽略私密配置文件与运行状态文件
+config.json
+monitor_state.json
+ip_geo_cache.json
+*.log
+__pycache__/
+*.pyc
+.DS_Store
