@@ -28,10 +28,10 @@
 
 ## 🚀 一键在线部署
 
-在你的主 VPS 上执行以下单行命令：
+在你的主 VPS 上执行以下单行命令（全发行版通用，无需前置 sudo）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/firstwxx1/vps-security-monitor/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/firstwxx1/vps-security-monitor/main/install.sh | bash
 ```
 
 安装完成后，在终端输入：

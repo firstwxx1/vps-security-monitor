@@ -362,7 +362,7 @@ class SecurityBot:
                 cid = self.chat_id
                 deploy_cmd = (
                     f"curl -fsSL https://raw.githubusercontent.com/firstwxx1/vps-security-monitor/main/install.sh | "
-                    f"sudo bash -s -- --token '{token}' --chat '{cid}' --name '{final_name}' --auto"
+                    f"bash -s -- --token '{token}' --chat '{cid}' --name '{final_name}' --auto"
                 )
                 _, d_stdout, d_stderr = ssh.exec_command(deploy_cmd, timeout=90)
                 d_out = d_stdout.read().decode("utf-8", errors="ignore")
@@ -439,7 +439,7 @@ class SecurityBot:
     def show_one_click_cmd(self, chat_id, msg_id=None):
         cmd = (
             f"curl -fsSL https://raw.githubusercontent.com/firstwxx1/vps-security-monitor/main/install.sh | "
-            f"sudo bash -s -- --token '{self.token}' --chat '{self.chat_id}' --auto"
+            f"bash -s -- --token '{self.token}' --chat '{self.chat_id}' --auto"
         )
         text = (
             f"⚡ <b>专属一键安装接入命令</b>\n"
