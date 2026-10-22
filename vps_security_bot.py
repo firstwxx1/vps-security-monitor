@@ -262,14 +262,14 @@ class SecurityBot:
         text = (
             f"➕ <b>在 Telegram 里添加 VPS 节点</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"请直接在当前聊天窗口<b>回复目标 VPS 的 SSH 信息</b>：\n\n"
-            f"📌 <b>格式示例</b>：\n"
-            f"<code>IP 密码</code> (默认使用 root 用户和 22 端口)\n"
-            f"例如: <code>107.172.83.41 MyPassword123</code>\n\n"
-            f"或者完整格式：\n"
-            f"<code>IP 端口 用户名 密码 别名(可选)</code>\n"
-            f"例如: <code>107.172.83.41 22 root MyPassword123 美西高防</code>\n\n"
-            f"🤖 机器人将自动通过 SSH 登录目标 VPS 并一键完成安全引擎部署！\n"
+            f"请直接在当前聊天窗口<b>回复目标 VPS 的信息</b>：\n\n"
+            f"📌 <b>方式 1：免密直接收录 (已在目标机跑过安装脚本)</b>\n"
+            f"发送：<code>IP [别名]</code>\n"
+            f"例如：<code>107.172.83.41 localhost</code> 或 <code>107.172.83.41 香港CN2</code>\n\n"
+            f"📌 <b>方式 2：全自动远程部署 (未跑过安装脚本)</b>\n"
+            f"发送：<code>IP 密码 [别名]</code>\n"
+            f"例如：<code>107.172.83.41 MyPassword123 美西节点</code>\n"
+            f"或完整格式：<code>107.172.83.41 22 root MyPassword123 美西节点</code>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"<i>如需取消，可点击下方按钮返回。</i>"
         )
@@ -287,13 +287,61 @@ class SecurityBot:
             self.send_msg(chat_id, text, reply_markup=kb)
 
     def process_add_vps_text(self, chat_id, raw_text):
-        """解析用户发送的 SSH 凭据并在后台线程部署"""
+        """解析用户发送的信息：支持免密快速录入（发送 IP 或 IP 别名）与自动 SSH 部署（发送 IP 端口 用户 密码）"""
         self.user_states.pop(chat_id, None)
         parts = raw_text.strip().split()
+        if not parts:
+            return
+
+        # 模式 1: 免密快速收录 (直接发送 IP 或 IP 别名，无需 SSH 密码)
+        # 例如用户在远端已跑过一键安装，或者不想提供 SSH 密码
+        is_ip_only = False
+        if len(parts) == 1 and re.match(r"^(\d{1,3}\.){3}\d{1,3}$", parts[0]):
+            is_ip_only = True
+        elif len(parts) == 2 and re.match(r"^(\d{1,3}\.){3}\d{1,3}$", parts[0]) and not any(c in parts[1] for c in "!@#$%^&*+=~"):
+            # 第二个参数不是密码（不含特殊字符，或者是中文/单词别名）
+            is_ip_only = True
+
+        if is_ip_only:
+            host = parts[0].strip()
+            custom_name = parts[1].strip() if len(parts) == 2 else f"vps-{host}"
+            display_name = f"{custom_name} ({host})" if custom_name != host else host
+
+            nodes = load_nodes()
+            nodes = [n for n in nodes if n.get("host") != host]
+            nodes.append({
+                "name": display_name,
+                "host": host,
+                "port": 22,
+                "user": "root",
+                "is_local": False,
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            })
+            save_nodes(nodes)
+
+            self.send_msg(
+                chat_id,
+                f"✅ <b>[VPS 节点收录成功！]</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🏷️ <b>节点标识</b>: <code>{html_escape(display_name)}</code>\n"
+                f"🌐 <b>主机 IP</b>: <code>{host}</code>\n"
+                f"📦 <b>已纳管 VPS</b>: 共 <code>{len(nodes)}</code> 台\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"<i>该 VPS 已成功加入你的监控中心！发送 /nodes 可随时查看。</i>",
+                reply_markup={
+                    "inline_keyboard": [
+                        [{"text": "📋 查看已纳管 VPS 列表", "callback_data": "nav:nodes"}]
+                    ]
+                }
+            )
+            return
+
         if len(parts) < 2:
             self.send_msg(
                 chat_id,
-                "❌ 格式不正确！请至少提供 <code>IP 密码</code>，例如：\n<code>107.172.83.41 YourPassword</code>"
+                "❌ 格式不正确！\n"
+                "• <b>免密收录</b>：直接发送 <code>IP [别名]</code>，例如：<code>107.172.83.41 香港CN2</code>\n"
+                "• <b>自动部署</b>：发送 <code>IP 密码</code>，例如：<code>107.172.83.41 MyPassword123</code>"
             )
             return
 
@@ -664,6 +712,46 @@ class SecurityBot:
             self.run_check_all(chat_id)
         elif data == "act:daily_all":
             self.run_daily_all(chat_id)
+        elif data.startswith("act:reg_quick:"):
+            parts = data.split(":", 3)
+            ip = parts[2]
+            name = parts[3] if len(parts) > 3 else f"vps-{ip}"
+            display_name = f"{name} ({ip})" if name != ip else ip
+
+            nodes = load_nodes()
+            nodes = [n for n in nodes if n.get("host") != ip]
+            nodes.append({
+                "name": display_name,
+                "host": ip,
+                "port": 22,
+                "user": "root",
+                "is_local": False,
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            })
+            save_nodes(nodes)
+
+            self.answer_callback(cb_id, f"✅ 已成功录入节点: {display_name}")
+            updated_text = (
+                f"✅ <b>[VPS 节点录入成功！]</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🏷️ <b>节点名称</b>: <code>{html_escape(display_name)}</code>\n"
+                f"🌐 <b>网络地址</b>: <code>{ip}</code>\n"
+                f"📦 <b>当前纳管</b>: 共 <code>{len(nodes)}</code> 台 VPS\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"<i>该 VPS 已正式收录进中央监控列表，可在 /nodes 中随时查看与巡检！</i>"
+            )
+            kb = {
+                "inline_keyboard": [
+                    [
+                        {"text": "📋 查看已纳管 VPS 列表", "callback_data": "nav:nodes"},
+                        {"text": "🔍 立即巡检", "callback_data": f"act:chk_host:{ip}"}
+                    ]
+                ]
+            }
+            if msg_id:
+                self.edit_msg(chat_id, msg_id, updated_text, reply_markup=kb)
+            else:
+                self.send_msg(chat_id, updated_text, reply_markup=kb)
         elif data.startswith("act:chk_node:"):
             idx = int(data.split(":")[-1])
             self.run_node_check(chat_id, node_idx=idx)

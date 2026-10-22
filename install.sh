@@ -225,17 +225,58 @@ if [ "$AUTO_MODE" = true ]; then
     # 确保 cron 服务启动
     systemctl restart cron 2>/dev/null || systemctl restart cronie 2>/dev/null || service cron restart 2>/dev/null || service crond restart 2>/dev/null || true
 
-    # 如果传入了 Token，发送上线问候报文
+    # 如果传入了 Token，发送上线问候报文 (附带一键录入按钮)
     if [ -n "$CLI_TOKEN" ]; then
         node_display="${CLI_NAME:-$(hostname 2>/dev/null || echo 'VPS节点')}"
-        python3 - "${INSTALL_DIR}" "${node_display}" << 'EOF'
-import sys, os
-sys.path.insert(0, sys.argv[1])
+        public_ip="$(curl -sS -m 4 https://api.ipify.org 2>/dev/null || curl -sS -m 4 ifconfig.me 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
+        public_ip="${public_ip:-127.0.0.1}"
+        os_info="$(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d'=' -f2 | tr -d '\"' || uname -sr)"
+
+        python3 - "${INSTALL_DIR}" "${node_display}" "${public_ip}" "${os_info}" << 'EOF'
+import sys, os, json, urllib.request
+
+install_dir = sys.argv[1]
+node_name = sys.argv[2]
+public_ip = sys.argv[3]
+os_info = sys.argv[4]
+
+cfg_path = os.path.join(install_dir, "config.json")
 try:
-    import vps_security_guard as guard
-    cfg = guard.load_config()
-    guard.send_telegram(cfg, f"🔔 新 VPS 节点接入成功！\n节点名称: {sys.argv[2]}\n安全引擎与 Crontab 定时守护已全部就绪。")
-except Exception:
+    with open(cfg_path, 'r', encoding='utf-8') as f:
+        cfg = json.load(f)
+
+    token = cfg.get("telegram", {}).get("bot_token")
+    chat_id = cfg.get("telegram", {}).get("chat_id")
+
+    if token and chat_id:
+        text = (
+            f"🔔 <b>新 VPS 节点接入成功！</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🏷️ <b>节点名称</b>: <code>{node_name}</code>\n"
+            f"🌐 <b>公网地址</b>: <code>{public_ip}</code>\n"
+            f"💻 <b>操作系统</b>: <code>{os_info}</code>\n"
+            f"🛡️ <b>安全守护</b>: 增量拦截与每日巡检已就绪\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"👇 <b>点击下方按钮，即可将该 VPS 加入中央监控列表：</b>"
+        )
+        cb_data = f"act:reg_quick:{public_ip}:{node_name}"
+        if len(cb_data.encode('utf-8')) > 64:
+            cb_data = f"act:reg_quick:{public_ip}:{node_name[:15]}"
+
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "reply_markup": {
+                "inline_keyboard": [
+                    [{"text": "📥 一键将此 VPS 录入列表", "callback_data": cb_data}]
+                ]
+            }
+        }
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=10)
+except Exception as e:
     pass
 EOF
     fi
