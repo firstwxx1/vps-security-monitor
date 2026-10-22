@@ -478,58 +478,141 @@ class SecurityBot:
         name = target.get("name", "VPS")
         is_local = target.get("is_local", False)
 
-        self.send_msg(chat_id, f"🔍 正在对 <b>{html_escape(name)}</b> 执行突发安全检测...")
+        res = self.send_msg(chat_id, f"🔍 正在对 <b>{html_escape(name)}</b> 执行突发安全检测...")
+        msg_id = res.get("result", {}).get("message_id") if res else None
 
         def worker():
-            if is_local:
-                subprocess.run(["python3", GUARD_PY, "check", "--interactive"], timeout=30)
-            else:
-                try:
+            try:
+                import vps_security_guard as guard
+                cfg = load_config()
+                alert_thresh = cfg.get("security", {}).get("alert_threshold_failures", 5)
+
+                if is_local:
+                    state = guard.load_state()
+                    nginx_log = cfg.get("logs", {}).get("nginx_access_log", "/var/log/nginx/access.log")
+                    login_paths = cfg.get("security", {}).get("login_paths", [])
+
+                    lines = guard.read_incremental_lines(nginx_log, "nginx", state)
+                    guard.save_state(state)
+
+                    failed_logins, _ = guard.parse_nginx_lines(lines, login_paths)
+                    if len(failed_logins) >= alert_thresh:
+                        unique_ips = len(set(fl["ip"] for fl in failed_logins))
+                        text = (
+                            f"🔔 <b>[突发拦截告警] · {html_escape(name)}</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━\n"
+                            f"🚨 <b>风险级别</b>: 高危撞库/爆破\n"
+                            f"📊 <b>拦截次数</b>: 捕获到 <code>{len(failed_logins)}</code> 次失败登录\n"
+                            f"📍 <b>攻击来源</b>: 来自 <code>{unique_ips}</code> 个不同 IP\n"
+                            f"🕒 <b>检测时间</b>: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>\n\n"
+                            f"💡 <i>建议在控制面板中查看防护策略。</i>"
+                        )
+                    else:
+                        fail_desc = f"（近几分钟捕获到 {len(failed_logins)} 次失败，低于报警阈值）" if failed_logins else "（未捕获到任何后台失败请求）"
+                        text = (
+                            f"✅ <b>[突发安全巡检完成]</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━\n"
+                            f"🏷️ <b>目标节点</b>: <code>{html_escape(name)}</code>\n"
+                            f"🟢 <b>运行状态</b>: 安全健康\n"
+                            f"🔎 <b>检测结果</b>: 访问日志运行平稳 {fail_desc}\n"
+                            f"🕒 <b>巡检时间</b>: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+                        )
+                else:
                     import paramiko
                     ssh = paramiko.SSHClient()
                     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                    ssh.connect(target["host"], port=target.get("port", 22), username=target.get("user", "root"), password=target.get("password", ""), timeout=15)
-                    ssh.exec_command("python3 /opt/vps-security-monitor/vps_security_guard.py check --interactive", timeout=30)
+                    ssh.connect(target["host"], port=target.get("port", 22), username=target.get("user", "root"), password=target.get("password", ""), timeout=8)
+                    ssh.exec_command("python3 /opt/vps-security-monitor/vps_security_guard.py check --interactive", timeout=15)
                     ssh.close()
-                except Exception as e:
-                    self.send_msg(chat_id, f"❌ 连接 <code>{html_escape(name)}</code> 失败: {html_escape(str(e))}")
+                    text = (
+                        f"✅ <b>[突发安全巡检完成]</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"🏷️ <b>目标节点</b>: <code>{html_escape(name)}</code>\n"
+                        f"🟢 <b>运行状态</b>: 远程通信正常，安全守护运行中\n"
+                        f"🕒 <b>巡检时间</b>: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+                    )
 
-        threading.Thread(target=worker, daemon=True).start()
+                kb = {
+                    "inline_keyboard": [
+                        [
+                            {"text": "🔄 再次巡检", "callback_data": f"act:chk_node:{node_idx if node_idx is not None else 0}"},
+                            {"text": "📋 节点列表", "callback_data": "nav:nodes"}
+                        ],
+                        [{"text": "🔙 返回主控制台", "callback_data": "nav:home"}]
+                    ]
+                }
+                if msg_id:
+                    self.edit_msg(chat_id, msg_id, text, reply_markup=kb)
+                else:
+                    self.send_msg(chat_id, text, reply_markup=kb)
 
-    def run_node_daily(self, chat_id, node_idx=None):
-        nodes = load_nodes()
-        if node_idx is None or node_idx < 0 or node_idx >= len(nodes):
-            self.send_msg(chat_id, "未找到目标节点！")
-            return
-
-        target = nodes[node_idx]
-        name = target.get("name", "VPS")
-        is_local = target.get("is_local", False)
-
-        self.send_msg(chat_id, f"📊 正在生成 <b>{html_escape(name)}</b> 的安全日报...")
-
-        def worker():
-            if is_local:
-                subprocess.run(["python3", GUARD_PY, "daily"])
-            else:
-                try:
-                    import paramiko
-                    ssh = paramiko.SSHClient()
-                    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                    ssh.connect(target["host"], port=target.get("port", 22), username=target.get("user", "root"), password=target.get("password", ""), timeout=15)
-                    ssh.exec_command("python3 /opt/vps-security-monitor/vps_security_guard.py daily", timeout=30)
-                    ssh.close()
-                except Exception as e:
-                    self.send_msg(chat_id, f"❌ 连接 <code>{html_escape(name)}</code> 失败: {html_escape(str(e))}")
+            except Exception as e:
+                err_text = f"❌ <b>巡检异常 · {html_escape(name)}</b>\n原因: <code>{html_escape(str(e))}</code>"
+                if msg_id:
+                    self.edit_msg(chat_id, msg_id, err_text)
+                else:
+                    self.send_msg(chat_id, err_text)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def run_check_all(self, chat_id):
         nodes = load_nodes()
-        self.send_msg(chat_id, f"🚀 开始对全部 <b>{len(nodes)}</b> 台 VPS 发起安全巡检...")
-        for idx in range(len(nodes)):
-            self.run_node_check(chat_id, node_idx=idx)
-            time.sleep(1)
+        res = self.send_msg(chat_id, f"🚀 <b>正在对全节点发起突发安全巡检...</b>\n共 <code>{len(nodes)}</code> 台 VPS，请稍候 1~2 秒...")
+        msg_id = res.get("result", {}).get("message_id") if res else None
+
+        def worker():
+            results = []
+            for idx, target in enumerate(nodes):
+                name = target.get("name", f"VPS-{idx}")
+                is_local = target.get("is_local", False)
+                try:
+                    if is_local:
+                        import vps_security_guard as guard
+                        cfg = load_config()
+                        state = guard.load_state()
+                        nginx_log = cfg.get("logs", {}).get("nginx_access_log", "/var/log/nginx/access.log")
+                        lines = guard.read_incremental_lines(nginx_log, "nginx", state)
+                        guard.save_state(state)
+                        failed, _ = guard.parse_nginx_lines(lines, cfg.get("security", {}).get("login_paths", []))
+                        if len(failed) >= cfg.get("security", {}).get("alert_threshold_failures", 5):
+                            results.append(f"· <b>{html_escape(name)}</b>: ⚠️ 发现 {len(failed)} 次拦截")
+                        else:
+                            results.append(f"· <b>{html_escape(name)}</b>: 🟢 安全健康 (0 次攻击)")
+                    else:
+                        import paramiko
+                        ssh = paramiko.SSHClient()
+                        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                        ssh.connect(target["host"], port=target.get("port", 22), username=target.get("user", "root"), password=target.get("password", ""), timeout=6)
+                        ssh.exec_command("python3 /opt/vps-security-monitor/vps_security_guard.py check", timeout=10)
+                        ssh.close()
+                        results.append(f"· <b>{html_escape(name)}</b>: 🟢 在线安全")
+                except Exception as e:
+                    results.append(f"· <b>{html_escape(name)}</b>: ❌ 连接失败 ({html_escape(str(e)[:25])})")
+
+            body = "\n".join(results)
+            final_text = (
+                f"✅ <b>[全节点突发安全巡检完成]</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"📊 <b>巡检统计</b>: 共检测 <code>{len(nodes)}</code> 台 VPS\n"
+                f"{body}\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🕒 <b>完成时间</b>: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+            )
+            kb = {
+                "inline_keyboard": [
+                    [
+                        {"text": "🔄 重新巡检", "callback_data": "act:check_all"},
+                        {"text": "📊 全节点日报", "callback_data": "act:daily_all"}
+                    ],
+                    [{"text": "🔙 返回主控制台", "callback_data": "nav:home"}]
+                ]
+            }
+            if msg_id:
+                self.edit_msg(chat_id, msg_id, final_text, reply_markup=kb)
+            else:
+                self.send_msg(chat_id, final_text, reply_markup=kb)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def run_daily_all(self, chat_id):
         nodes = load_nodes()
