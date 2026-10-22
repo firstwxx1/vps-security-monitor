@@ -482,14 +482,14 @@ class SecurityBot:
 
         def worker():
             if is_local:
-                subprocess.run(["python3", GUARD_PY, "check"])
+                subprocess.run(["python3", GUARD_PY, "check", "--interactive"], timeout=30)
             else:
                 try:
                     import paramiko
                     ssh = paramiko.SSHClient()
                     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
                     ssh.connect(target["host"], port=target.get("port", 22), username=target.get("user", "root"), password=target.get("password", ""), timeout=15)
-                    ssh.exec_command("python3 /opt/vps-security-monitor/vps_security_guard.py check", timeout=30)
+                    ssh.exec_command("python3 /opt/vps-security-monitor/vps_security_guard.py check --interactive", timeout=30)
                     ssh.close()
                 except Exception as e:
                     self.send_msg(chat_id, f"❌ 连接 <code>{html_escape(name)}</code> 失败: {html_escape(str(e))}")

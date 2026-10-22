@@ -51,6 +51,12 @@ def safe_print(msg):
 
 
 
+def html_escape(text):
+    if not text:
+        return ""
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
 def load_config():
     if not os.path.exists(CONFIG_FILE):
         example_path = os.path.join(SCRIPT_DIR, "config.example.json")
@@ -553,21 +559,49 @@ def check_ssl_expiry(domain):
 
 
 # ----------------- 模式 A: 突发攻击检测 (check) -----------------
-def run_check_mode(cfg):
+def run_check_mode(cfg, interactive=False):
     state = load_state()
     nginx_log = cfg.get("logs", {}).get("nginx_access_log", "/var/log/nginx/access.log")
     login_paths = cfg.get("security", {}).get("login_paths", [])
     alert_thresh = cfg.get("security", {}).get("alert_threshold_failures", 5)
     site_names = cfg.get("sites", {})
+    node_name = cfg.get("node_name", "本机 (主节点)")
 
     nginx_lines = read_incremental_lines(nginx_log, "nginx", state)
     save_state(state)
 
     if not nginx_lines:
+        if interactive:
+            msg = (
+                f"✅ <b>[突发安全巡检完成] · [{html_escape(node_name)}]</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🟢 <b>运行状态</b>: 安全健康\n"
+                f"🔎 <b>检测结果</b>: 访问日志运行平稳，最近未发现任何后台登录失败或异常状态码。\n"
+                f"🕒 <b>巡检时间</b>: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+            )
+            send_telegram(cfg, msg)
         return
 
     failed_logins, _ = parse_nginx_lines(nginx_lines, login_paths)
     if len(failed_logins) < alert_thresh:
+        if interactive:
+            if len(failed_logins) == 0:
+                msg = (
+                    f"✅ <b>[突发安全巡检完成] · [{html_escape(node_name)}]</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"🟢 <b>运行状态</b>: 安全健康\n"
+                    f"🔎 <b>检测结果</b>: 最近未发现任何敏感后台登录失败尝试或撞库行为。\n"
+                    f"🕒 <b>巡检时间</b>: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+                )
+            else:
+                msg = (
+                    f"ℹ️ <b>[突发安全巡检完成] · [{html_escape(node_name)}]</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"🟡 <b>运行状态</b>: 发现轻微偶发失败 (未达报警阈值)\n"
+                    f"📊 <b>失败次数</b>: 仅捕获到 {len(failed_logins)} 次失败，低于报警阈值 ({alert_thresh}次)，无需干预。\n"
+                    f"🕒 <b>巡检时间</b>: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+                )
+            send_telegram(cfg, msg)
         return
 
     # 按 (host, path) 聚合统计
@@ -801,7 +835,8 @@ def main():
     cmd = sys.argv[1].lower()
 
     if cmd == "check":
-        run_check_mode(cfg)
+        interactive = "--interactive" in sys.argv or "-i" in sys.argv
+        run_check_mode(cfg, interactive=interactive)
     elif cmd == "daily":
         run_daily_mode(cfg)
     elif cmd == "test":
