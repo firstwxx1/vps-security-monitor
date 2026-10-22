@@ -92,15 +92,15 @@ class SecurityBot:
         self.chat_id = str(self.cfg.get("telegram", {}).get("chat_id", "")).strip()
 
     def get_reply_keyboard(self):
-        """返回底部持久快捷键菜单 (ReplyKeyboardMarkup)"""
+        """返回底部快捷键菜单 (is_persistent=False 允许用户随时折叠/收起)"""
         return {
             "keyboard": [
                 [{"text": "➕ 添加 VPS 节点"}, {"text": "📋 VPS 节点列表"}],
                 [{"text": "🔍 立即全节点巡检"}, {"text": "📊 全节点安全日报"}],
-                [{"text": "⚡ 专属一键命令"}, {"text": "🛡️ 唤出主控制台"}]
+                [{"text": "⚡ 专属一键命令"}, {"text": "🔽 收起菜单"}]
             ],
             "resize_keyboard": True,
-            "is_persistent": True
+            "is_persistent": False
         }
 
     def register_commands(self):
@@ -191,6 +191,9 @@ class SecurityBot:
                 ],
                 [
                     {"text": "⚡ 生成一键安装接入命令", "callback_data": "act:one_click_cmd"},
+                    {"text": "⌨️ 展开/唤出底部键盘", "callback_data": "act:show_reply_kb"}
+                ],
+                [
                     {"text": "🔄 刷新控制面板", "callback_data": "nav:home"}
                 ]
             ]
@@ -567,6 +570,8 @@ class SecurityBot:
             self.prompt_add_vps(chat_id, msg_id)
         elif data == "act:one_click_cmd":
             self.show_one_click_cmd(chat_id, msg_id)
+        elif data == "act:show_reply_kb":
+            self.send_msg(chat_id, "⌨️ 底部快捷按键已展开 (随时可点击右下角或自带按钮折叠收起)：", reply_markup=self.get_reply_keyboard())
         elif data == "act:check_all":
             self.run_check_all(chat_id)
         elif data == "act:daily_all":
@@ -598,9 +603,14 @@ class SecurityBot:
 
         if text in ("/start", "/menu", "菜单", "🛡️ 唤出主控制台"):
             self.user_states.pop(chat_id, None)
-            # 发送激活底部常驻快捷键菜单
-            self.send_msg(chat_id, "🛡️ 控制中心已就绪，已激活底部常驻快捷键菜单与 Menu 按钮：", reply_markup=self.get_reply_keyboard())
             self.show_main_menu(chat_id)
+            return
+        elif text in ("🔽 收起菜单", "收起菜单", "收起", "/hide"):
+            self.send_msg(
+                chat_id,
+                "⌨️ <b>底部快捷菜单已收起。</b>\n\n💡 随时可通过点击左下角 <b>【Menu】</b> 按钮或发送 <code>/start</code> 查看控制台！",
+                reply_markup={"remove_keyboard": True}
+            )
             return
         elif text in ("/nodes", "节点列表", "📋 VPS 节点列表"):
             self.show_nodes_menu(chat_id)
