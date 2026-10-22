@@ -33,6 +33,7 @@ AUTO_MODE=false
 CLI_TOKEN=""
 CLI_CHAT=""
 CLI_NAME=""
+CLI_MASTER=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -42,6 +43,8 @@ while [[ $# -gt 0 ]]; do
             CLI_CHAT="$2"; shift 2 ;;
         --name)
             CLI_NAME="$2"; shift 2 ;;
+        --master)
+            CLI_MASTER="$2"; shift 2 ;;
         --auto)
             AUTO_MODE=true; shift ;;
         *)
@@ -225,20 +228,21 @@ if [ "$AUTO_MODE" = true ]; then
     # 确保 cron 服务启动
     systemctl restart cron 2>/dev/null || systemctl restart cronie 2>/dev/null || service cron restart 2>/dev/null || service crond restart 2>/dev/null || true
 
-    # 如果传入了 Token，发送上线问候报文 (附带一键录入按钮)
+    # 如果传入了 Token，执行向主控端自动入库并推送 Telegram
     if [ -n "$CLI_TOKEN" ]; then
         node_display="${CLI_NAME:-$(hostname 2>/dev/null || echo 'VPS节点')}"
         public_ip="$(curl -sS -m 4 https://api.ipify.org 2>/dev/null || curl -sS -m 4 ifconfig.me 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
         public_ip="${public_ip:-127.0.0.1}"
         os_info="$(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d'=' -f2 | tr -d '\"' || uname -sr)"
 
-        python3 - "${INSTALL_DIR}" "${node_display}" "${public_ip}" "${os_info}" << 'EOF'
-import sys, os, json, urllib.request
+        python3 - "${INSTALL_DIR}" "${node_display}" "${public_ip}" "${os_info}" "${CLI_MASTER}" << 'EOF'
+import sys, os, json, urllib.request, urllib.parse, hashlib
 
 install_dir = sys.argv[1]
 node_name = sys.argv[2]
 public_ip = sys.argv[3]
 os_info = sys.argv[4]
+cli_master = sys.argv[5] if len(sys.argv) > 5 else ""
 
 cfg_path = os.path.join(install_dir, "config.json")
 try:
@@ -249,30 +253,95 @@ try:
     chat_id = cfg.get("telegram", {}).get("chat_id")
 
     if token and chat_id:
-        text = (
-            f"🔔 <b>新 VPS 节点接入成功！</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"🏷️ <b>节点名称</b>: <code>{node_name}</code>\n"
-            f"🌐 <b>公网地址</b>: <code>{public_ip}</code>\n"
-            f"💻 <b>操作系统</b>: <code>{os_info}</code>\n"
-            f"🛡️ <b>安全守护</b>: 增量拦截与每日巡检已就绪\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"👇 <b>点击下方按钮，即可将该 VPS 加入中央监控列表：</b>"
-        )
-        cb_data = f"act:reg_quick:{public_ip}:{node_name}"
-        if len(cb_data.encode('utf-8')) > 64:
-            cb_data = f"act:reg_quick:{public_ip}:{node_name[:15]}"
+        master_ip = ""
+        master_port = "9527"
+        secret = hashlib.sha256(token.encode('utf-8')).hexdigest()[:16]
 
-        payload = {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "reply_markup": {
-                "inline_keyboard": [
-                    [{"text": "📥 一键将此 VPS 录入列表", "callback_data": cb_data}]
-                ]
+        if cli_master:
+            if ":" in cli_master:
+                master_ip, master_port = cli_master.split(":", 1)
+            else:
+                master_ip = cli_master
+        else:
+            # 尝试通过 Telegram 机器人的 ShortDescription 自动发现主控 IP 与端口
+            try:
+                desc_url = f"https://api.telegram.org/bot{token}/getMyShortDescription"
+                with urllib.request.urlopen(desc_url, timeout=5) as r:
+                    desc_res = json.loads(r.read().decode('utf-8'))
+                    s_desc = desc_res.get("result", {}).get("short_description", "")
+                    if s_desc.startswith("master:"):
+                        parts = s_desc.split(":")
+                        master_ip = parts[1]
+                        master_port = parts[2] if len(parts) > 2 else "9527"
+                        if len(parts) > 3:
+                            secret = parts[3]
+            except Exception:
+                pass
+
+        # 尝试通过 HTTP API 自动向主控机登记纳管
+        registered = False
+        if master_ip:
+            try:
+                reg_url = f"http://{master_ip}:{master_port}/api/register?" + urllib.parse.urlencode({
+                    "ip": public_ip,
+                    "name": node_name,
+                    "os": os_info,
+                    "secret": secret
+                })
+                with urllib.request.urlopen(reg_url, timeout=6) as reg_r:
+                    reg_res = json.loads(reg_r.read().decode('utf-8'))
+                    if reg_res.get("ok"):
+                        registered = True
+                        print("[+] 节点已成功自动注册登记至中央监控主控机！")
+            except Exception:
+                pass
+
+        if registered:
+            text = (
+                f"🔔 <b>[新 VPS 节点接入成功]</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🏷️ <b>节点名称</b>: <code>{node_name}</code>\n"
+                f"🌐 <b>公网地址</b>: <code>{public_ip}</code>\n"
+                f"💻 <b>操作系统</b>: <code>{os_info}</code>\n"
+                f"🛡️ <b>纳管状态</b>: ✅ 已全自动录入中央监控列表\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"<i>该 VPS 已纳管，可在 Telegram 中发送 /nodes 查看并随时发起巡检。</i>"
+            )
+            payload = {
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "reply_markup": {
+                    "inline_keyboard": [
+                        [{"text": "📋 查看已纳管 VPS 列表", "callback_data": "nav:nodes"}]
+                    ]
+                }
             }
-        }
+        else:
+            cb_data = f"act:reg_quick:{public_ip}:{node_name}"
+            if len(cb_data.encode('utf-8')) > 64:
+                cb_data = f"act:reg_quick:{public_ip}:{node_name[:15]}"
+            text = (
+                f"🔔 <b>[新 VPS 节点接入成功]</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🏷️ <b>节点名称</b>: <code>{node_name}</code>\n"
+                f"🌐 <b>公网地址</b>: <code>{public_ip}</code>\n"
+                f"💻 <b>操作系统</b>: <code>{os_info}</code>\n"
+                f"🛡️ <b>安全守护</b>: 增量拦截与每日巡检已就绪\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"👇 <b>点击下方按钮，即可将该 VPS 加入中央监控列表：</b>"
+            )
+            payload = {
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "reply_markup": {
+                    "inline_keyboard": [
+                        [{"text": "📥 一键将此 VPS 录入列表", "callback_data": cb_data}]
+                    ]
+                }
+            }
+
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=10)

@@ -655,6 +655,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/opt/vps-security-monitor
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 /opt/vps-security-monitor/vps_security_bot.py
 Restart=always
 RestartSec=5
@@ -680,6 +681,168 @@ EOF
     read -n 1 -s -r -p "按任意键返回..."
 }
 
+# 🌐 多 VPS 节点纳管与状态控制
+manage_nodes() {
+    while true; do
+        clear
+        echo -e "${CYAN}=====================================================${PLAIN}"
+        echo -e "${CYAN}             🌐 多 VPS 节点纳管与状态控制             ${PLAIN}"
+        echo -e "${CYAN}=====================================================${PLAIN}"
+        python3 - "${SCRIPT_DIR}/nodes.json" << 'EOF'
+import sys, os, json
+
+nodes_file = sys.argv[1]
+nodes = []
+if os.path.exists(nodes_file):
+    try:
+        with open(nodes_file, 'r', encoding='utf-8') as f:
+            nodes = json.load(f)
+    except Exception:
+        nodes = []
+
+print(f"当前已纳管 VPS 总数: {len(nodes)} 台\n")
+if not nodes:
+    print("  [暂无纳管节点]")
+else:
+    for idx, n in enumerate(nodes):
+        name = n.get("name", "未命名")
+        host = n.get("host", "")
+        port = n.get("port", 22)
+        user = n.get("user", "root")
+        is_local = n.get("is_local", False)
+        tag = "📍 本机主节点" if is_local else f"🌐 {user}@{host}:{port}"
+        print(f"  {idx + 1}. {name}")
+        print(f"     └ {tag}")
+EOF
+        echo -e "${CYAN}-----------------------------------------------------${PLAIN}"
+        echo -e "  ${YELLOW}1.${PLAIN} 快速录入新 VPS 节点 (输入 IP / 别名)"
+        echo -e "  ${YELLOW}2.${PLAIN} 移除已有 VPS 节点"
+        echo -e "  ${YELLOW}3.${PLAIN} 获取专属一键安装命令 (在目标 VPS 终端执行全自动接入)"
+        echo -e "  ${YELLOW}4.${PLAIN} 立即发起突发安全巡检"
+        echo -e "  ${YELLOW}0.${PLAIN} 返回主菜单"
+        echo ""
+        read -p "请输入选项 [0-4]: " n_opt
+        case "$n_opt" in
+            1)
+                echo ""
+                read -p "请输入目标 VPS 的公网 IP: " target_ip
+                if [ -z "$target_ip" ]; then
+                    echo -e "${RED}[错误] IP 不能为空！${PLAIN}"
+                    sleep 1
+                    continue
+                fi
+                read -p "请输入节点别名 (如 香港CN2 / 美西节点，可回车留空): " target_name
+                python3 - "${SCRIPT_DIR}/nodes.json" "$target_ip" "$target_name" << 'EOF'
+import sys, os, json
+from datetime import datetime
+
+nodes_file = sys.argv[1]
+ip = sys.argv[2].strip()
+name = sys.argv[3].strip() if len(sys.argv) > 3 else ""
+display_name = f"{name} ({ip})" if (name and name != ip) else f"VPS-{ip}"
+
+nodes = []
+if os.path.exists(nodes_file):
+    try:
+        with open(nodes_file, 'r', encoding='utf-8') as f:
+            nodes = json.load(f)
+    except Exception:
+        pass
+
+nodes = [n for n in nodes if n.get("host") != ip]
+nodes.append({
+    "name": display_name,
+    "host": ip,
+    "port": 22,
+    "user": "root",
+    "is_local": False,
+    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+})
+with open(nodes_file, 'w', encoding='utf-8') as f:
+    json.dump(nodes, f, ensure_ascii=False, indent=2)
+print(f"[+] 成功录入节点: {display_name}")
+EOF
+                echo -e "${GREEN}[+] 录入成功！该 VPS 已加入监控列表。${PLAIN}"
+                sleep 1.5
+                ;;
+            2)
+                read -p "请输入要移除的节点序号: " del_idx
+                if [ -n "$del_idx" ]; then
+                    python3 - "${SCRIPT_DIR}/nodes.json" "$del_idx" << 'EOF'
+import sys, os, json
+
+nodes_file = sys.argv[1]
+try:
+    idx = int(sys.argv[2]) - 1
+    with open(nodes_file, 'r', encoding='utf-8') as f:
+        nodes = json.load(f)
+    if 0 <= idx < len(nodes):
+        if nodes[idx].get("is_local"):
+            print("[-] 本机主节点不可移除！")
+        else:
+            removed = nodes.pop(idx)
+            with open(nodes_file, 'w', encoding='utf-8') as f:
+                json.dump(nodes, f, ensure_ascii=False, indent=2)
+            print(f"[+] 已成功移除节点: {removed.get('name')}")
+    else:
+        print("[-] 节点序号不存在！")
+except Exception as e:
+    print(f"[-] 移除失败: {e}")
+EOF
+                fi
+                sleep 1.5
+                ;;
+            3)
+                clear
+                echo -e "${CYAN}=====================================================${PLAIN}"
+                echo -e "${CYAN}             ⚡ 专属一键安装接入命令                  ${PLAIN}"
+                echo -e "${CYAN}=====================================================${PLAIN}"
+                local token=$(python3 - "$CONFIG_FILE" << 'EOF'
+import sys, json
+try:
+    with open(sys.argv[1], 'r', encoding='utf-8') as f:
+        cfg = json.load(f)
+    print(cfg.get('telegram', {}).get('bot_token', ''))
+except Exception:
+    print('')
+EOF
+)
+                local chat_id=$(python3 - "$CONFIG_FILE" << 'EOF'
+import sys, json
+try:
+    with open(sys.argv[1], 'r', encoding='utf-8') as f:
+        cfg = json.load(f)
+    print(cfg.get('telegram', {}).get('chat_id', ''))
+except Exception:
+    print('')
+EOF
+)
+                local pub_ip=$(curl -sS -m 4 https://api.ipify.org 2>/dev/null || curl -sS -m 4 ifconfig.me 2>/dev/null || echo "45.130.166.10")
+                echo -e "只需在你要纳管监控的${GREEN}任意 Linux VPS 终端${PLAIN}上粘贴运行以下命令："
+                echo ""
+                echo -e "${YELLOW}curl -fsSL https://raw.githubusercontent.com/firstwxx1/vps-security-monitor/main/install.sh | bash -s -- --token '${token}' --chat '${chat_id}' --master '${pub_ip}:9527' --auto${PLAIN}"
+                echo ""
+                echo -e "✅ 运行后，该 VPS 将${GREEN}全自动上报登记至本机的 nodes.json${PLAIN}，无需手动干预！"
+                echo ""
+                read -n 1 -s -r -p "按任意键返回..."
+                ;;
+            4)
+                echo -e "${YELLOW}[*] 正在执行突发安全巡检...${PLAIN}"
+                python3 "${SCRIPT_DIR}/vps_security_guard.py" check --interactive
+                echo ""
+                read -n 1 -s -r -p "按任意键返回..."
+                ;;
+            0)
+                break
+                ;;
+            *)
+                echo -e "${RED}输入无效！${PLAIN}"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
 # 主菜单循环
 main_menu() {
     check_python
@@ -702,15 +865,16 @@ main_menu() {
         echo -e " ${GREEN}5.${PLAIN} 配置备份校验状态 (R2 / 本地目录 / 自定义命令)"
         echo -e "${PURPLE}-----------------------------------------------------${PLAIN}"
         echo -e " ${CYAN}6.${PLAIN} 🤖 管理 Telegram 交互机器人后台守护 (TG内一键加VPS)"
-        echo -e " ${CYAN}7.${PLAIN} 立即执行：突发攻击增量检测 (check)"
-        echo -e " ${CYAN}8.${PLAIN} 立即生成：全天安全日报 (daily)"
-        echo -e " ${CYAN}9.${PLAIN} 一键安装 / 更新 Crontab 定时任务"
-        echo -e " ${CYAN}10.${PLAIN} 一键卸载 Crontab 定时任务"
-        echo -e " ${CYAN}11.${PLAIN} 系统环境与日志排查自检"
+        echo -e " ${CYAN}7.${PLAIN} 🌐 多 VPS 节点纳管与状态控制 (查看/添加/移除节点)"
+        echo -e " ${CYAN}8.${PLAIN} 立即执行：突发攻击增量检测 (check)"
+        echo -e " ${CYAN}9.${PLAIN} 立即生成：全天安全日报 (daily)"
+        echo -e " ${CYAN}10.${PLAIN} 一键安装 / 更新 Crontab 定时任务"
+        echo -e " ${CYAN}11.${PLAIN} 一键卸载 Crontab 定时任务"
+        echo -e " ${CYAN}12.${PLAIN} 系统环境与日志排查自检"
         echo -e "${PURPLE}-----------------------------------------------------${PLAIN}"
         echo -e " ${YELLOW}0.${PLAIN} 退出管理菜单"
         echo -e "${PURPLE}=====================================================${PLAIN}"
-        read -p "请输入选项 [0-11]: " choice
+        read -p "请输入选项 [0-12]: " choice
         case "$choice" in
             1) config_telegram ;;
             2) config_paths ;;
@@ -718,11 +882,12 @@ main_menu() {
             4) config_ssh_whitelist ;;
             5) config_backup ;;
             6) manage_bot_daemon ;;
-            7) run_manual_check ;;
-            8) run_manual_daily ;;
-            9) install_crontab ;;
-            10) uninstall_crontab ;;
-            11) diagnose_system ;;
+            7) manage_nodes ;;
+            8) run_manual_check ;;
+            9) run_manual_daily ;;
+            10) install_crontab ;;
+            11) uninstall_crontab ;;
+            12) diagnose_system ;;
             0) clear; exit 0 ;;
             *) echo -e "${RED}输入无效，请重新输入！${PLAIN}"; sleep 1 ;;
         esac

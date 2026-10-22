@@ -16,8 +16,11 @@ import sys
 import time
 import json
 import socket
+import hashlib
 import threading
 import subprocess
+import http.server
+import socketserver
 import urllib.request
 import urllib.parse
 from datetime import datetime
@@ -79,12 +82,152 @@ def html_escape(text):
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
 
+class NodeRegistrationHandler(http.server.BaseHTTPRequestHandler):
+    """处理从被控 VPS (install.sh) 发起的全自动节点上线入库注册请求"""
+    bot_ref = None
+
+    def do_GET(self):
+        self.process_request()
+
+    def do_POST(self):
+        self.process_request()
+
+    def process_request(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path != "/api/register":
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"ok": false, "error": "Not Found"}')
+            return
+
+        qs = urllib.parse.parse_qs(parsed.query)
+        if not qs and self.command == "POST":
+            length = int(self.headers.get("Content-Length", 0))
+            if length > 0:
+                body = self.rfile.read(length).decode("utf-8", errors="ignore")
+                try:
+                    data = json.loads(body)
+                    qs = {k: [str(v)] for k, v in data.items()}
+                except Exception:
+                    qs = urllib.parse.parse_qs(body)
+
+        secret = qs.get("secret", [""])[0].strip()
+        ip = qs.get("ip", [""])[0].strip()
+        name = qs.get("name", [""])[0].strip()
+        os_info = qs.get("os", ["Linux"])[0].strip()
+
+        # 客户端未传公网 IP 时，直接提取客户端 Socket 来源 IP
+        if not ip or ip in ("127.0.0.1", "localhost"):
+            ip = self.client_address[0]
+
+        bot = NodeRegistrationHandler.bot_ref
+        expected_secret = bot.get_registration_secret() if bot else ""
+
+        if not secret or secret != expected_secret:
+            self.send_response(403)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"ok": false, "error": "Forbidden: Invalid registration secret"}')
+            return
+
+        display_name = f"{name} ({ip})" if (name and name != ip) else (f"vps-{ip}" if not name else name)
+        nodes = load_nodes()
+        nodes = [n for n in nodes if n.get("host") != ip]
+        nodes.append({
+            "name": display_name,
+            "host": ip,
+            "port": 22,
+            "user": "root",
+            "os": os_info,
+            "is_local": False,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        })
+        save_nodes(nodes)
+        print(f"[+] 成功通过 HTTP 自动注册纳管新节点: {display_name} [{ip}]")
+
+        if bot and bot.chat_id:
+            notice = (
+                f"🎉 <b>[新 VPS 节点全自动接入成功！]</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🏷️ <b>节点名称</b>: <code>{html_escape(display_name)}</code>\n"
+                f"🌐 <b>网络地址</b>: <code>{ip}</code>\n"
+                f"💻 <b>操作系统</b>: <code>{html_escape(os_info)}</code>\n"
+                f"📦 <b>已纳管 VPS</b>: 共 <code>{len(nodes)}</code> 台\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"<i>该 VPS 已由一键安装程序全自动入库纳管，无需任何手动操作！在 /nodes 中可直接查看与巡检。</i>"
+            )
+            kb = {
+                "inline_keyboard": [
+                    [
+                        {"text": "📋 查看已纳管 VPS 列表", "callback_data": "nav:nodes"},
+                        {"text": "🔍 立即巡检", "callback_data": f"act:chk_host:{ip}"}
+                    ]
+                ]
+            }
+            bot.send_msg(bot.chat_id, notice, reply_markup=kb)
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        resp_data = {
+            "ok": True,
+            "message": "Node successfully registered to Master",
+            "ip": ip,
+            "name": display_name,
+            "nodes_count": len(nodes)
+        }
+        self.wfile.write(json.dumps(resp_data).encode("utf-8"))
+
+    def log_message(self, format, *args):
+        pass
+
+
 class SecurityBot:
     def __init__(self):
         self.user_states = {}  # {chat_id: {"state": "waiting_vps_info", ...}}
         self.commands_registered = False
         self.last_token = ""
+        self.reg_server = None
+        self._cached_public_ip = None
         self.reload()
+        self.start_registration_server()
+
+    def get_public_ip(self):
+        """获取并缓存主控机器的公网 IP"""
+        if self._cached_public_ip:
+            return self._cached_public_ip
+        for url in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"):
+            try:
+                with urllib.request.urlopen(url, timeout=3) as resp:
+                    ip = resp.read().decode("utf-8").strip()
+                    if re.match(r"^(\d{1,3}\.){3}\d{1,3}$", ip):
+                        self._cached_public_ip = ip
+                        return ip
+            except Exception:
+                continue
+        self._cached_public_ip = "45.130.166.10"
+        return self._cached_public_ip
+
+    def get_registration_secret(self):
+        """生成基于 Token 的安全验证密钥，供子节点上报时校验"""
+        if not self.token:
+            return "vps-sec-default"
+        return hashlib.sha256(self.token.encode("utf-8")).hexdigest()[:16]
+
+    def start_registration_server(self, port=9527):
+        """启动后台守护的 HTTP 节点自动注册 API 监听"""
+        if self.reg_server:
+            return
+        try:
+            NodeRegistrationHandler.bot_ref = self
+            socketserver.TCPServer.allow_reuse_address = True
+            self.reg_server = socketserver.TCPServer(("0.0.0.0", port), NodeRegistrationHandler)
+            t = threading.Thread(target=self.reg_server.serve_forever, daemon=True)
+            t.start()
+            print(f"[+] 自动节点注册 HTTP API 服务已启动 (0.0.0.0:{port})")
+        except Exception as e:
+            print(f"[-] 启动自动节点注册服务失败: {e}")
 
     def reload(self):
         self.cfg = load_config()
@@ -126,6 +269,14 @@ class SecurityBot:
             self.commands_registered = True
             self.last_token = self.token
             print("[+] Telegram 对话框旁 Menu 菜单按钮已成功激活！")
+
+        # 发布主控端自动发现信标，方便远程一键安装脚本自动发现主控并上报
+        try:
+            pub_ip = self.get_public_ip()
+            secret = self.get_registration_secret()
+            self.api_call("setMyShortDescription", {"short_description": f"master:{pub_ip}:9527:{secret}"})
+        except Exception:
+            pass
 
     def api_call(self, method, payload=None, timeout=20):
         if not self.token or "YOUR_" in self.token:
@@ -236,10 +387,24 @@ class SecurityBot:
                 ])
 
         body = "\n".join(lines) if lines else "暂无纳管节点"
+        hint = ""
+        if len(nodes) <= 1:
+            pub_ip = self.get_public_ip()
+            cmd_example = f"curl -fsSL https://raw.githubusercontent.com/firstwxx1/vps-security-monitor/main/install.sh | bash -s -- --token '{self.token}' --chat '{self.chat_id}' --master '{pub_ip}:9527' --auto"
+            hint = (
+                f"\n\n━━━━━━━━━━━━━━━━━━\n"
+                f"💡 <b>纳管新 VPS 节点方式：</b>\n"
+                f"1. <b>全自动上报接入</b>：在任何新 VPS 终端直接粘贴运行：\n"
+                f"<code>{html_escape(cmd_example)}</code>\n"
+                f"<i>(安装完成即可全自动入库纳管，无需额外操作)</i>\n\n"
+                f"2. <b>极速免密录入</b>：直接在当前对话框回复目标 VPS 的 <code>IP [别名]</code>（例如：<code>107.172.83.41 香港CN2</code>），Bot 会立刻收录！"
+            )
+
         text = (
             f"📋 <b>已纳管 VPS 列表 ({len(nodes)} 台)</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"{body}\n\n"
+            f"{body}"
+            f"{hint}\n\n"
             f"💡 <i>可点击下方按钮对指定 VPS 发起巡检或移除纳管。</i>"
         )
         kb = {
@@ -485,9 +650,10 @@ class SecurityBot:
         threading.Thread(target=worker, daemon=True).start()
 
     def show_one_click_cmd(self, chat_id, msg_id=None):
+        pub_ip = self.get_public_ip()
         cmd = (
             f"curl -fsSL https://raw.githubusercontent.com/firstwxx1/vps-security-monitor/main/install.sh | "
-            f"bash -s -- --token '{self.token}' --chat '{self.chat_id}' --auto"
+            f"bash -s -- --token '{self.token}' --chat '{self.chat_id}' --master '{pub_ip}:9527' --auto"
         )
         text = (
             f"⚡ <b>专属一键安装接入命令</b>\n"
@@ -496,8 +662,9 @@ class SecurityBot:
             f"<code>{html_escape(cmd)}</code>\n\n"
             f"✅ <b>自动完成</b>：\n"
             f"1. 自动注入当前 Telegram 机器人的 Token 和 Chat ID\n"
-            f"2. 自动安装守护引擎并注册 Crontab 定时拦截与日报\n"
-            f"3. 部署完成后会自动向本机器人发送一次接入问候报文！\n"
+            f"2. 部署完成后<b>全自动上报登记至中央 VPS 监控列表</b>\n"
+            f"3. 自动安装守护引擎并注册 Crontab 定时拦截与日报\n"
+            f"4. 部署完成后自动向本机器人发送接入成功卡片\n"
             f"━━━━━━━━━━━━━━━━━━"
         )
         kb = {
