@@ -34,6 +34,7 @@ CLI_TOKEN=""
 CLI_CHAT=""
 CLI_NAME=""
 CLI_MASTER=""
+IS_AGENT=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -44,7 +45,9 @@ while [[ $# -gt 0 ]]; do
         --name)
             CLI_NAME="$2"; shift 2 ;;
         --master)
-            CLI_MASTER="$2"; shift 2 ;;
+            CLI_MASTER="$2"; IS_AGENT=true; shift 2 ;;
+        --agent)
+            IS_AGENT=true; shift ;;
         --auto)
             AUTO_MODE=true; shift ;;
         *)
@@ -143,13 +146,14 @@ detect_nginx_log() {
 DETECTED_LOG="$(detect_nginx_log)"
 
 # 写入命令行传入的配置参数或更新默认日志路径
-python3 - "$CLI_TOKEN" "$CLI_CHAT" "$CLI_NAME" "$DETECTED_LOG" "${INSTALL_DIR}/config.json" << 'EOF'
+python3 - "$CLI_TOKEN" "$CLI_CHAT" "$CLI_NAME" "$DETECTED_LOG" "${INSTALL_DIR}/config.json" "$IS_AGENT" << 'EOF'
 import sys, json, os
 
 token, chat, name, detected_log, cfg_path = (
     sys.argv[1].strip(), sys.argv[2].strip(), sys.argv[3].strip(),
     sys.argv[4].strip(), sys.argv[5].strip()
 )
+is_agent = sys.argv[6].strip().lower() if len(sys.argv) > 6 else "false"
 
 cfg = {}
 if os.path.exists(cfg_path):
@@ -165,6 +169,8 @@ if chat:
     cfg.setdefault("telegram", {})["chat_id"] = chat
 if name:
     cfg["node_name"] = name
+if is_agent == "true":
+    cfg["role"] = "agent"
 
 # 如果默认配置的日志路径不存在但探测到了存在的路径，自动修正
 current_log = cfg.get("logs", {}).get("nginx_access_log", "")
@@ -185,8 +191,15 @@ EOF
 chmod +x "${BIN_LINK}"
 
 # 5. 配置后台守护服务 (适配 Systemd 或自动兜底)
-if command -v systemctl &>/dev/null && [ -d /run/systemd/system ]; then
-    cat << 'EOF' > /etc/systemd/system/vps-security-bot.service
+if [ "$IS_AGENT" = true ]; then
+    echo -e "${YELLOW}[*] 当前节点为被控子节点 (Agent)，自动关闭并禁用 Telegram Bot 轮询进程，防止多端冲突...${PLAIN}"
+    systemctl stop vps-security-bot.service 2>/dev/null || true
+    systemctl disable vps-security-bot.service 2>/dev/null || true
+    pkill -f "vps_security_bot.py" 2>/dev/null || true
+else
+    # 仅主控节点运行 Telegram 交互机器人 Daemon
+    if command -v systemctl &>/dev/null && [ -d /run/systemd/system ]; then
+        cat << 'EOF' > /etc/systemd/system/vps-security-bot.service
 [Unit]
 Description=VPS Security Monitor Telegram Bot Daemon
 After=network.target
@@ -203,16 +216,17 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload 2>/dev/null || true
-    if [ -n "$CLI_TOKEN" ]; then
-        systemctl enable vps-security-bot.service 2>/dev/null || true
-        systemctl restart vps-security-bot.service 2>/dev/null || true
-    fi
-else
-    # 非 Systemd 环境 (Alpine / OpenRC / Docker 等)
-    if [ -n "$CLI_TOKEN" ]; then
-        pkill -f "vps_security_bot.py" 2>/dev/null || true
-        nohup python3 "${INSTALL_DIR}/vps_security_bot.py" >/dev/null 2>&1 &
+        systemctl daemon-reload 2>/dev/null || true
+        if [ -n "$CLI_TOKEN" ]; then
+            systemctl enable vps-security-bot.service 2>/dev/null || true
+            systemctl restart vps-security-bot.service 2>/dev/null || true
+        fi
+    else
+        # 非 Systemd 环境 (Alpine / OpenRC / Docker 等)
+        if [ -n "$CLI_TOKEN" ]; then
+            pkill -f "vps_security_bot.py" 2>/dev/null || true
+            nohup python3 "${INSTALL_DIR}/vps_security_bot.py" >/dev/null 2>&1 &
+        fi
     fi
 fi
 

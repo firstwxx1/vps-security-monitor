@@ -262,6 +262,9 @@ class SecurityBot:
 
     def reload(self):
         self.cfg = load_config()
+        if self.cfg.get("role") == "agent":
+            print("[-] 当前节点角色为被控子节点 (Agent)，无需且禁止运行 Telegram 交互机器人！退出中...")
+            sys.exit(0)
         self.token = self.cfg.get("telegram", {}).get("bot_token", "").strip()
         self.chat_id = str(self.cfg.get("telegram", {}).get("chat_id", "")).strip()
 
@@ -428,7 +431,7 @@ class SecurityBot:
         hint = ""
         if len(nodes) <= 1:
             pub_ip = self.get_public_ip()
-            cmd_example = f"curl -fsSL https://raw.githubusercontent.com/firstwxx1/vps-security-monitor/main/install.sh | bash -s -- --token '{self.token}' --chat '{self.chat_id}' --master '{pub_ip}:9527' --auto"
+            cmd_example = f"curl -fsSL https://raw.githubusercontent.com/firstwxx1/vps-security-monitor/main/install.sh | bash -s -- --token '{self.token}' --chat '{self.chat_id}' --master '{pub_ip}:9527' --agent --auto"
             hint = (
                 f"\n\n━━━━━━━━━━━━━━━━━━\n"
                 f"💡 <b>纳管新 VPS 节点方式：</b>\n"
@@ -725,7 +728,7 @@ class SecurityBot:
         pub_ip = self.get_public_ip()
         cmd = (
             f"curl -fsSL https://raw.githubusercontent.com/firstwxx1/vps-security-monitor/main/install.sh | "
-            f"bash -s -- --token '{self.token}' --chat '{self.chat_id}' --master '{pub_ip}:9527' --auto"
+            f"bash -s -- --token '{self.token}' --chat '{self.chat_id}' --master '{pub_ip}:9527' --agent --auto"
         )
         text = (
             f"⚡ <b>专属一键安装接入命令</b>\n"
