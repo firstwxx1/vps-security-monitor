@@ -131,7 +131,7 @@ class NodeRegistrationHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b'{"ok": false, "error": "Forbidden: Invalid registration secret"}')
             return
 
-        display_name = f"{name} ({ip})" if (name and name != ip) else (f"vps-{ip}" if not name else name)
+        display_name = name.strip() if name else f"vps-{ip}"
         nodes = load_nodes()
         nodes = [n for n in nodes if n.get("host") != ip]
         nodes.append({
@@ -542,7 +542,7 @@ class SecurityBot:
         if is_ip_only:
             host = parts[0].strip()
             custom_name = parts[1].strip() if len(parts) == 2 else f"vps-{host}"
-            display_name = f"{custom_name} ({host})" if custom_name != host else host
+            display_name = custom_name.strip() if custom_name else f"vps-{host}"
 
             nodes = load_nodes()
             nodes = [n for n in nodes if n.get("host") != host]
@@ -640,7 +640,7 @@ class SecurityBot:
                 os_name = sys_out[2].strip() if len(sys_out) >= 3 else (sys_out[1].strip() if len(sys_out) >= 2 else "Linux")
 
                 # 如果没有指定别名，使用 别名 或 hostname
-                final_name = custom_name if (custom_name and not custom_name.startswith("vps-")) else f"{hostname} ({host})"
+                final_name = custom_name.strip() if (custom_name and not custom_name.startswith("vps-")) else (hostname if hostname else f"vps-{host}")
 
                 # 2. 部署 security-monitor 并配置定时任务
                 token = self.token

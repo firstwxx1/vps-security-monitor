@@ -813,8 +813,7 @@ try:
         nodes = json.load(f)
     if 0 <= idx < len(nodes):
         old_name = nodes[idx].get("name")
-        host = nodes[idx].get("host", "")
-        display = f"{new_name} ({host})" if (host and host not in new_name and not nodes[idx].get("is_local")) else new_name
+        display = new_name
         nodes[idx]["name"] = display
         with open(nodes_file, 'w', encoding='utf-8') as f:
             json.dump(nodes, f, ensure_ascii=False, indent=2)
