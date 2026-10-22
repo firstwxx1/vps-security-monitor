@@ -82,12 +82,45 @@ def html_escape(text):
 class SecurityBot:
     def __init__(self):
         self.user_states = {}  # {chat_id: {"state": "waiting_vps_info", ...}}
+        self.commands_registered = False
+        self.last_token = ""
         self.reload()
 
     def reload(self):
         self.cfg = load_config()
         self.token = self.cfg.get("telegram", {}).get("bot_token", "").strip()
         self.chat_id = str(self.cfg.get("telegram", {}).get("chat_id", "")).strip()
+
+    def get_reply_keyboard(self):
+        """返回底部持久快捷键菜单 (ReplyKeyboardMarkup)"""
+        return {
+            "keyboard": [
+                [{"text": "➕ 添加 VPS 节点"}, {"text": "📋 VPS 节点列表"}],
+                [{"text": "🔍 立即全节点巡检"}, {"text": "📊 全节点安全日报"}],
+                [{"text": "⚡ 专属一键命令"}, {"text": "🛡️ 唤出主控制台"}]
+            ],
+            "resize_keyboard": True,
+            "is_persistent": True
+        }
+
+    def register_commands(self):
+        """注册 Telegram 左下角 Menu 弹出菜单 (setMyCommands + setChatMenuButton)"""
+        if not self.token or "YOUR_" in self.token:
+            return
+        commands = [
+            {"command": "start", "description": "🛡️ 唤出安全控制中心主菜单"},
+            {"command": "nodes", "description": "📋 查看已纳管 VPS 列表"},
+            {"command": "add", "description": "➕ 在 TG 中添加 VPS 节点"},
+            {"command": "check", "description": "🔍 立即发起全节点突发巡检"},
+            {"command": "daily", "description": "📊 立即获取全节点今日安全日报"},
+            {"command": "cmd", "description": "⚡ 获取专属一键安装接入命令"},
+        ]
+        res = self.api_call("setMyCommands", {"commands": commands})
+        if res and res.get("ok"):
+            self.api_call("setChatMenuButton", {"menu_button": {"type": "commands"}})
+            self.commands_registered = True
+            self.last_token = self.token
+            print("[+] Telegram 官方菜单 (Menu 按钮) 注册成功！")
 
     def api_call(self, method, payload=None, timeout=20):
         if not self.token or "YOUR_" in self.token:
@@ -563,21 +596,26 @@ class SecurityBot:
         state_data = self.user_states.get(chat_id, {})
         current_state = state_data.get("state")
 
-        if text in ("/start", "/menu", "菜单"):
+        if text in ("/start", "/menu", "菜单", "🛡️ 唤出主控制台"):
             self.user_states.pop(chat_id, None)
+            # 发送激活底部常驻快捷键菜单
+            self.send_msg(chat_id, "🛡️ 控制中心已就绪，已激活底部常驻快捷键菜单与 Menu 按钮：", reply_markup=self.get_reply_keyboard())
             self.show_main_menu(chat_id)
             return
-        elif text in ("/nodes", "节点列表"):
+        elif text in ("/nodes", "节点列表", "📋 VPS 节点列表"):
             self.show_nodes_menu(chat_id)
             return
-        elif text in ("/add", "/add_vps", "添加"):
+        elif text in ("/add", "/add_vps", "添加", "➕ 添加 VPS 节点"):
             self.prompt_add_vps(chat_id)
             return
-        elif text in ("/check", "巡检"):
+        elif text in ("/check", "巡检", "🔍 立即全节点巡检"):
             self.run_check_all(chat_id)
             return
-        elif text in ("/daily", "日报"):
+        elif text in ("/daily", "日报", "📊 全节点安全日报"):
             self.run_daily_all(chat_id)
+            return
+        elif text in ("/cmd", "一键命令", "⚡ 专属一键命令"):
+            self.show_one_click_cmd(chat_id)
             return
 
         # 如果处于等待添加 VPS 状态，或者输入内容像 IP 凭据
@@ -597,6 +635,9 @@ class SecurityBot:
             if not self.token or "YOUR_" in self.token:
                 time.sleep(5)
                 continue
+
+            if not self.commands_registered or self.last_token != self.token:
+                self.register_commands()
 
             updates = self.api_call("getUpdates", {"offset": offset, "timeout": 20}, timeout=30)
             if not updates or not updates.get("ok"):
