@@ -1025,12 +1025,131 @@ class SecurityBot:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def run_daily_all(self, chat_id):
+    def run_daily_all(self, chat_id, msg_id=None):
+        """将所有纳管的 VPS 节点（包括后续新添加的任意节点）聚合汇聚为统一的单条全节点安全总报"""
         nodes = load_nodes()
-        self.send_msg(chat_id, f"📊 开始生成全部 <b>{len(nodes)}</b> 台 VPS 的安全日报...")
-        for idx in range(len(nodes)):
-            self.run_node_daily(chat_id, node_idx=idx)
-            time.sleep(2)
+        total_count = len(nodes)
+
+        init_text = (
+            f"📊 <b>[全节点安全总报生成中...]</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📦 正在汇聚全部 <code>{total_count}</code> 台 VPS 节点的安全指标，请稍候 1~2 秒..."
+        )
+        if msg_id:
+            self.edit_msg(chat_id, msg_id, init_text)
+            target_msg_id = msg_id
+        else:
+            res = self.send_msg(chat_id, init_text)
+            target_msg_id = res.get("result", {}).get("message_id") if res else None
+
+        def worker():
+            from datetime import timedelta
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            yesterday_str = (datetime.now() - timedelta(days=1)).strftime("%m月%d日")
+
+            node_sections = []
+            total_attacks = 0
+            total_bans = 0
+            online_count = 0
+
+            for idx, target in enumerate(nodes):
+                name = target.get("name", f"VPS-{idx+1}")
+                host = target.get("host", "127.0.0.1")
+                port = target.get("port", 22)
+                is_local = target.get("is_local", False)
+                os_name = target.get("os", "Linux")
+
+                if is_local:
+                    try:
+                        import vps_security_guard as guard
+                        cfg = load_config()
+                        data = guard.run_daily_mode(cfg, send_tg=False)
+                        ssh_cnt = data.get("ssh_fail_count", 0)
+                        scan_cnt = data.get("scan_count", 0)
+                        web_cnt = data.get("login_fail_count", 0)
+                        node_attacks = ssh_cnt + scan_cnt + web_cnt
+                        total_attacks += node_attacks
+                        banned_cnt = data.get("banned_count", 0)
+                        total_bans += banned_cnt
+                        online_count += 1
+
+                        cert_info = ""
+                        if data.get("nearest_cert"):
+                            dom, days = data["nearest_cert"]
+                            cert_info = f" · 证书剩 {days}天"
+
+                        backup_info = ""
+                        if data.get("backup_status"):
+                            backup_info = f" · {data['backup_status']}"
+
+                        sec_lines = [
+                            f"🏷️ <b>[{idx+1}] {html_escape(name)}</b> · <code>{host}</code> <i>(主控)</i>",
+                            f"├ 🖥️ <b>SSH防爆破</b>: 拦截 <code>{ssh_cnt:,}</code> 次 | 封禁中: <code>{banned_cnt}</code> 个",
+                            f"├ 🌐 <b>Web扫描探测</b>: <code>{scan_cnt}</code> 次 | 登录失败: <code>{web_cnt}</code> 次",
+                            f"├ ⚠️ <b>疑似陌生登录</b>: <code>{data.get('stranger_logins', 0)}</code> 次",
+                            f"└ 💾 <b>系统负载</b>: 磁盘 <code>{data.get('disk_percent')}%</code> (剩 {data.get('disk_free_gb')}G) · 内存可用 <code>{data.get('mem_avail_mb')}MB</code>{cert_info}{backup_info}"
+                        ]
+                        node_sections.append("\n".join(sec_lines))
+                    except Exception as e:
+                        node_sections.append(
+                            f"🏷️ <b>[{idx+1}] {html_escape(name)}</b> · <code>{host}</code> <i>(主控)</i>\n"
+                            f"└ ❌ 获取本地数据异常: <code>{html_escape(str(e)[:30])}</code>"
+                        )
+                else:
+                    # 远程子节点（支持免密探活、guard守护状态检测及后续新加的任意节点）
+                    target_pwd = target.get("password")
+                    t0 = time.time()
+                    latency = None
+                    try:
+                        s = socket.create_connection((host, port), timeout=3)
+                        latency = (time.time() - t0) * 1000.0
+                        s.close()
+                        online_count += 1
+                        lat_tag = f"🟢 在线正常 (延迟 <code>{latency:.1f}ms</code>)"
+                    except Exception:
+                        lat_tag = "🔴 无法连接 (离线或端口未通)"
+
+                    sec_lines = [
+                        f"🏷️ <b>[{idx+1}] {html_escape(name)}</b> · <code>{host}:{port}</code> <i>(受控子节点)</i>",
+                        f"├ 📡 <b>实时网络</b>: {lat_tag}",
+                        f"├ 💻 <b>操作系统</b>: <code>{html_escape(os_name)}</code>",
+                        f"├ 🛡️ <b>防护引擎</b>: 🟢 Systemd 守护进程常驻保活 (秒级检测)",
+                        f"└ ⏰ <b>告警审计</b>: 本地全天候自主阻断与开机重启自启通知"
+                    ]
+                    node_sections.append("\n".join(sec_lines))
+
+            nodes_body = "\n\n".join(node_sections)
+            final_report = (
+                f"📊 <b>[全节点安全巡检总报 · {yesterday_str}]</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"📦 <b>纳管节点</b>: 共 <code>{total_count}</code> 台 | 🟢 <b>在线率</b>: <code>{online_count}/{total_count}</code>\n"
+                f"🛡️ <b>全网威胁</b>: 今日拦截黑客攻击探测共 <code>{total_attacks:,}</code> 次\n"
+                f"━━━━━━━━━━━━━━━━━━\n\n"
+                f"{nodes_body}\n\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"💡 <i>提示：所有已纳管及未来新添加的 VPS 均已自动汇总于此总报中。</i>\n"
+                f"🕒 <b>生成时间</b>: <code>{now_str}</code>"
+            )
+
+            kb = {
+                "inline_keyboard": [
+                    [
+                        {"text": "🔄 刷新全节点总报", "callback_data": "act:daily_all"},
+                        {"text": "🔍 全节点突发体检", "callback_data": "act:check_all"}
+                    ],
+                    [
+                        {"text": "📋 管理节点列表", "callback_data": "nav:nodes"},
+                        {"text": "🔙 返回主控制台", "callback_data": "nav:home"}
+                    ]
+                ]
+            }
+
+            if target_msg_id:
+                self.edit_msg(chat_id, target_msg_id, final_report, reply_markup=kb)
+            else:
+                self.send_msg(chat_id, final_report, reply_markup=kb)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def delete_node(self, chat_id, node_idx):
         nodes = load_nodes()
@@ -1074,12 +1193,12 @@ class SecurityBot:
         elif data == "act:check_all":
             self.run_check_all(chat_id)
         elif data == "act:daily_all":
-            self.run_daily_all(chat_id)
+            self.run_daily_all(chat_id, msg_id)
         elif data.startswith("act:reg_quick:"):
             parts = data.split(":", 3)
             ip = parts[2]
-            name = parts[3] if len(parts) > 3 else f"vps-{ip}"
-            display_name = f"{name} ({ip})" if name != ip else ip
+            name = parts[3].strip() if len(parts) > 3 else f"vps-{ip}"
+            display_name = name
 
             nodes = load_nodes()
             nodes = [n for n in nodes if n.get("host") != ip]

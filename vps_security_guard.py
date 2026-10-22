@@ -674,7 +674,7 @@ def run_check_mode(cfg, interactive=False):
 
 
 # ----------------- 模式 B: 安全日报 (daily) -----------------
-def run_daily_mode(cfg):
+def run_daily_mode(cfg, send_tg=True):
     now = datetime.now()
     yesterday_str = (now - timedelta(days=1)).strftime("%m月%d日")
 
@@ -818,7 +818,23 @@ def run_daily_mode(cfg):
     lines.append(f"💽 磁盘已用 {sys_stats['disk_percent']}% (剩 {sys_stats['disk_free_gb']}G) · 内存可用 {sys_stats['mem_avail_mb']} MB")
 
     msg = "\n".join(lines)
-    send_telegram(cfg, msg)
+    if send_tg:
+        send_telegram(cfg, msg)
+    return {
+        "msg": msg,
+        "scan_count": scan_count,
+        "login_fail_count": login_fail_count,
+        "ssh_fail_count": ssh_fail_count,
+        "new_bans": f2b.get("today_total_bans", 0),
+        "banned_count": f2b.get("banned_count", 0),
+        "top_login_ips": top_login_ips,
+        "stranger_logins": len(stranger_logins),
+        "disk_percent": sys_stats.get("disk_percent", 0),
+        "disk_free_gb": sys_stats.get("disk_free_gb", 0),
+        "mem_avail_mb": sys_stats.get("mem_avail_mb", 0),
+        "nearest_cert": nearest_cert,
+        "backup_status": backup_status
+    }
 
 
 # ----------------- 保活与开机自启动模块 -----------------
