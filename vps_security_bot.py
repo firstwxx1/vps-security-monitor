@@ -805,19 +805,54 @@ class SecurityBot:
                             f"🕒 <b>巡检时间</b>: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
                         )
                 else:
-                    import paramiko
-                    ssh = paramiko.SSHClient()
-                    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                    ssh.connect(target["host"], port=target.get("port", 22), username=target.get("user", "root"), password=target.get("password", ""), timeout=8)
-                    ssh.exec_command("python3 /opt/vps-security-monitor/vps_security_guard.py check --interactive", timeout=15)
-                    ssh.close()
-                    text = (
-                        f"✅ <b>[突发安全巡检完成]</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━\n"
-                        f"🏷️ <b>目标节点</b>: <code>{html_escape(name)}</code>\n"
-                        f"🟢 <b>运行状态</b>: 远程通信正常，安全守护运行中\n"
-                        f"🕒 <b>巡检时间</b>: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
-                    )
+                    target_host = target.get("host")
+                    target_port = target.get("port", 22)
+                    target_pwd = target.get("password")
+                    if target_pwd:
+                        import paramiko
+                        ssh = paramiko.SSHClient()
+                        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                        ssh.connect(target_host, port=target_port, username=target.get("user", "root"), password=target_pwd, timeout=8)
+                        ssh.exec_command("python3 /opt/vps-security-monitor/vps_security_guard.py check --interactive", timeout=15)
+                        ssh.close()
+                        text = (
+                            f"✅ <b>[突发安全巡检完成]</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━\n"
+                            f"🏷️ <b>目标节点</b>: <code>{html_escape(name)}</code>\n"
+                            f"🟢 <b>运行状态</b>: 远程通信正常，安全守护运行中\n"
+                            f"🕒 <b>巡检时间</b>: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+                        )
+                    else:
+                        t0 = time.time()
+                        latency = None
+                        try:
+                            s = socket.create_connection((target_host, target_port), timeout=4)
+                            latency = (time.time() - t0) * 1000.0
+                            s.close()
+                        except Exception:
+                            pass
+
+                        if latency is not None:
+                            text = (
+                                f"✅ <b>[突发安全巡检完成]</b>\n"
+                                f"━━━━━━━━━━━━━━━━━━\n"
+                                f"🏷️ <b>目标节点</b>: <code>{html_escape(name)}</code>\n"
+                                f"🌐 <b>网络地址</b>: <code>{target_host}:{target_port}</code>\n"
+                                f"🟢 <b>在线状态</b>: 通信良好 (延迟 <code>{latency:.1f} ms</code>)\n"
+                                f"🛡️ <b>防护策略</b>: 本地 Systemd 守护进程常驻保活 (每60秒增量检测)\n"
+                                f"🕒 <b>巡检时间</b>: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>\n"
+                                f"━━━━━━━━━━━━━━━━━━\n"
+                                f"<i>该节点由其本地守护进程全天候自主防御，若遭遇撞库或代理池攻击将秒级报警！</i>"
+                            )
+                        else:
+                            text = (
+                                f"⚠️ <b>[突发安全巡检告警]</b>\n"
+                                f"━━━━━━━━━━━━━━━━━━\n"
+                                f"🏷️ <b>目标节点</b>: <code>{html_escape(name)}</code>\n"
+                                f"🌐 <b>网络地址</b>: <code>{target_host}:{target_port}</code>\n"
+                                f"🔴 <b>在线状态</b>: 端口连接超时 (可能关机或防火墙阻断)\n"
+                                f"🕒 <b>巡检时间</b>: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+                            )
 
                 kb = {
                     "inline_keyboard": [
@@ -866,13 +901,26 @@ class SecurityBot:
                         else:
                             results.append(f"· <b>{html_escape(name)}</b>: 🟢 安全健康 (0 次攻击)")
                     else:
-                        import paramiko
-                        ssh = paramiko.SSHClient()
-                        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                        ssh.connect(target["host"], port=target.get("port", 22), username=target.get("user", "root"), password=target.get("password", ""), timeout=6)
-                        ssh.exec_command("python3 /opt/vps-security-monitor/vps_security_guard.py check", timeout=10)
-                        ssh.close()
-                        results.append(f"· <b>{html_escape(name)}</b>: 🟢 在线安全")
+                        target_host = target.get("host")
+                        target_port = target.get("port", 22)
+                        target_pwd = target.get("password")
+                        if target_pwd:
+                            import paramiko
+                            ssh = paramiko.SSHClient()
+                            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                            ssh.connect(target_host, port=target_port, username=target.get("user", "root"), password=target_pwd, timeout=6)
+                            ssh.exec_command("python3 /opt/vps-security-monitor/vps_security_guard.py check", timeout=10)
+                            ssh.close()
+                            results.append(f"· <b>{html_escape(name)}</b>: 🟢 在线安全")
+                        else:
+                            t0 = time.time()
+                            try:
+                                s = socket.create_connection((target_host, target_port), timeout=3)
+                                lat = (time.time() - t0) * 1000.0
+                                s.close()
+                                results.append(f"· <b>{html_escape(name)}</b>: 🟢 在线正常 ({lat:.0f}ms)")
+                            except Exception:
+                                results.append(f"· <b>{html_escape(name)}</b>: 🔴 连接超时 (离线)")
                 except Exception as e:
                     results.append(f"· <b>{html_escape(name)}</b>: ❌ 连接失败 ({html_escape(str(e)[:25])})")
 
@@ -898,6 +946,79 @@ class SecurityBot:
                 self.edit_msg(chat_id, msg_id, final_text, reply_markup=kb)
             else:
                 self.send_msg(chat_id, final_text, reply_markup=kb)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def run_node_daily(self, chat_id, node_idx=None, host=None):
+        nodes = load_nodes()
+        target = None
+        if node_idx is not None and 0 <= node_idx < len(nodes):
+            target = nodes[node_idx]
+        elif host:
+            target = next((n for n in nodes if n.get("host") == host), None)
+
+        if not target:
+            self.send_msg(chat_id, "❌ 未找到目标节点！")
+            return
+
+        name = target.get("name", "VPS")
+        is_local = target.get("is_local", False)
+
+        def worker():
+            try:
+                if is_local:
+                    import vps_security_guard as guard
+                    cfg = load_config()
+                    guard.run_daily_mode(cfg)
+                else:
+                    target_host = target.get("host")
+                    target_port = target.get("port", 22)
+                    target_pwd = target.get("password")
+
+                    if target_pwd:
+                        import paramiko
+                        ssh = paramiko.SSHClient()
+                        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                        ssh.connect(target_host, port=target_port, username=target.get("user", "root"), password=target_pwd, timeout=8)
+                        ssh.exec_command("python3 /opt/vps-security-monitor/vps_security_guard.py daily", timeout=15)
+                        ssh.close()
+                    else:
+                        t0 = time.time()
+                        latency = None
+                        try:
+                            s = socket.create_connection((target_host, target_port), timeout=4)
+                            latency = (time.time() - t0) * 1000.0
+                            s.close()
+                        except Exception:
+                            pass
+
+                        lat_str = f"🟢 网络连通正常 (延迟 <code>{latency:.1f} ms</code>)" if latency is not None else "🔴 无法连接 (离线或端口未通)"
+                        os_name = target.get("os", "Linux")
+                        created = target.get("created_at", "未知")
+                        info_text = (
+                            f"🛡️ <b>[节点安全概览与运行状态] · [{html_escape(name)}]</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━\n"
+                            f"🏷️ <b>节点名称</b>: <code>{html_escape(name)}</code>\n"
+                            f"🌐 <b>网络地址</b>: <code>{target_host}:{target_port}</code>\n"
+                            f"💻 <b>操作系统</b>: <code>{html_escape(os_name)}</code>\n"
+                            f"📡 <b>实时网络</b>: {lat_str}\n"
+                            f"🛡️ <b>防护引擎</b>: 🟢 Systemd 守护进程常驻保活 (秒级/分钟级检测)\n"
+                            f"⏰ <b>早报机制</b>: 每天早晨 09:00 由该机器本地自动汇总生成并推送\n"
+                            f"📦 <b>纳管时间</b>: <code>{created}</code>\n"
+                            f"━━━━━━━━━━━━━━━━━━\n"
+                            f"<i>提示：该节点由其本地 Systemd 守护引擎自主执行全天候安全审计。</i>"
+                        )
+                        kb = {
+                            "inline_keyboard": [
+                                [
+                                    {"text": "🔍 即时安全巡检", "callback_data": f"act:chk_host:{target_host}"},
+                                    {"text": "📋 节点列表", "callback_data": "nav:nodes"}
+                                ]
+                            ]
+                        }
+                        self.send_msg(chat_id, info_text, reply_markup=kb)
+            except Exception as e:
+                self.send_msg(chat_id, f"❌ <b>生成日报失败 · {html_escape(name)}</b>\n原因: <code>{html_escape(str(e))}</code>")
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1156,11 +1277,15 @@ class SecurityBot:
                 offset = u["update_id"] + 1
                 try:
                     if "callback_query" in u:
-                        self.handle_callback(u["callback_query"])
+                        cb = u["callback_query"]
+                        print(f"[*] 收到按钮回调: from={cb.get('from',{}).get('id')} data={cb.get('data')}", flush=True)
+                        self.handle_callback(cb)
                     elif "message" in u:
-                        self.handle_message(u["message"])
+                        m = u["message"]
+                        print(f"[*] 收到消息: from={m.get('from',{}).get('id')} text={m.get('text')}", flush=True)
+                        self.handle_message(m)
                 except Exception as e:
-                    print(f"[-] 处理更新异常: {e}")
+                    print(f"[-] 处理更新异常: {e}", flush=True)
 
 
 def main():
