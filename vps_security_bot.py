@@ -104,23 +104,28 @@ class SecurityBot:
         }
 
     def register_commands(self):
-        """注册 Telegram 左下角 Menu 弹出菜单 (setMyCommands + setChatMenuButton)"""
+        """注册 Telegram 输入框左下角 Menu 弹出菜单 (setMyCommands + setChatMenuButton)"""
         if not self.token or "YOUR_" in self.token:
             return
         commands = [
-            {"command": "start", "description": "🛡️ 唤出安全控制中心主菜单"},
-            {"command": "nodes", "description": "📋 查看已纳管 VPS 列表"},
-            {"command": "add", "description": "➕ 在 TG 中添加 VPS 节点"},
-            {"command": "check", "description": "🔍 立即发起全节点突发巡检"},
-            {"command": "daily", "description": "📊 立即获取全节点今日安全日报"},
-            {"command": "cmd", "description": "⚡ 获取专属一键安装接入命令"},
+            {"command": "start", "description": "唤出控制中心主菜单"},
+            {"command": "nodes", "description": "查看已纳管VPS列表"},
+            {"command": "add", "description": "在TG中添加VPS节点"},
+            {"command": "check", "description": "立即全节点突发巡检"},
+            {"command": "daily", "description": "获取全节点安全日报"},
+            {"command": "cmd", "description": "专属一键安装命令"},
         ]
         res = self.api_call("setMyCommands", {"commands": commands})
         if res and res.get("ok"):
             self.api_call("setChatMenuButton", {"menu_button": {"type": "commands"}})
+            if self.chat_id:
+                try:
+                    self.api_call("setChatMenuButton", {"chat_id": int(self.chat_id), "menu_button": {"type": "commands"}})
+                except Exception:
+                    pass
             self.commands_registered = True
             self.last_token = self.token
-            print("[+] Telegram 官方菜单 (Menu 按钮) 注册成功！")
+            print("[+] Telegram 对话框旁 Menu 菜单按钮已成功激活！")
 
     def api_call(self, method, payload=None, timeout=20):
         if not self.token or "YOUR_" in self.token:
