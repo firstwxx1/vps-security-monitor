@@ -396,67 +396,133 @@ class SecurityBot:
 
     def show_nodes_menu(self, chat_id, msg_id=None):
         nodes = load_nodes()
+        total_count = len(nodes)
         lines = []
-        btn_rows = []
+
         for idx, n in enumerate(nodes):
             name = n.get("name", "未命名")
             host = n.get("host", "")
             port = n.get("port", 22)
-            user = n.get("user", "root")
             is_local = n.get("is_local", False)
+            role_desc = "主控中心" if is_local else "受控子节点"
 
-            tag = "📍 本机主节点" if is_local else f"🌐 {user}@{host}:{port}"
-            lines.append(f"<b>{idx + 1}. {html_escape(name)}</b>\n    └ {html_escape(tag)}")
-
-            # 操作按钮行
-            clean_name = name.split("(")[0].strip() if "(" in name else name
-            short_name = clean_name[:8] if len(clean_name) > 8 else clean_name
-            if is_local:
-                btn_rows.append([
-                    {"text": f"🔍 巡检: {short_name}", "callback_data": f"act:chk_node:{idx}"},
-                    {"text": "📊 日报", "callback_data": f"act:day_node:{idx}"},
-                    {"text": "✏️ 改名", "callback_data": f"act:ren_node:{idx}"}
-                ])
-            else:
-                btn_rows.append([
-                    {"text": f"🔍 巡检: {short_name}", "callback_data": f"act:chk_node:{idx}"},
-                    {"text": "📊 日报", "callback_data": f"act:day_node:{idx}"}
-                ])
-                btn_rows.append([
-                    {"text": f"✏️ 改名: {short_name}", "callback_data": f"act:ren_node:{idx}"},
-                    {"text": "🗑️ 移除", "callback_data": f"act:del_node:{idx}"}
-                ])
-
-        body = "\n".join(lines) if lines else "暂无纳管节点"
-        hint = ""
-        if len(nodes) <= 1:
-            pub_ip = self.get_public_ip()
-            cmd_example = f"curl -fsSL https://raw.githubusercontent.com/firstwxx1/vps-security-monitor/main/install.sh | bash -s -- --token '{self.token}' --chat '{self.chat_id}' --master '{pub_ip}:9527' --agent --auto"
-            hint = (
-                f"\n\n━━━━━━━━━━━━━━━━━━\n"
-                f"💡 <b>纳管新 VPS 节点方式：</b>\n"
-                f"1. <b>全自动上报接入</b>：在任何新 VPS 终端直接粘贴运行：\n"
-                f"<code>{html_escape(cmd_example)}</code>\n"
-                f"<i>(安装完成即可全自动入库纳管，无需额外操作)</i>\n\n"
-                f"2. <b>极速免密录入</b>：直接在当前对话框回复目标 VPS 的 <code>IP [别名]</code>（例如：<code>107.172.83.41 香港CN2</code>），Bot 会立刻收录！"
+            lines.append(
+                f"🖥️ <b>{idx + 1}. {html_escape(name)}</b>\n"
+                f"    ├ 🌐 <code>{host}:{port}</code> ({role_desc})\n"
+                f"    └ 🛡️ 状态: 🟢 守护常驻保活"
             )
 
+        body = "\n\n".join(lines) if lines else "暂无纳管节点"
+
+        # 动态自适应按钮网格：
+        # 每台节点生成一个直达专属管理卡片的按钮
+        # 若总数 <= 3 台，每行 1 个展示清晰名称；若总数 >= 4 台，每行 2 个紧凑排列，避免多节点按钮泛滥
+        node_buttons = []
+        for idx, n in enumerate(nodes):
+            name = n.get("name", f"VPS-{idx+1}")
+            clean_name = name.split("(")[0].strip() if "(" in name else name
+            short_name = clean_name[:12] if len(clean_name) > 12 else clean_name
+            node_buttons.append({
+                "text": f"🖥️ {idx + 1}. {short_name}",
+                "callback_data": f"act:node_detail:{idx}"
+            })
+
+        btn_rows = []
+        if total_count <= 3:
+            for b in node_buttons:
+                btn_rows.append([b])
+        else:
+            for i in range(0, len(node_buttons), 2):
+                btn_rows.append(node_buttons[i:i + 2])
+
+        # 全局快捷操作行
+        btn_rows.append([
+            {"text": "🔍 全节点突发体检", "callback_data": "act:check_all"},
+            {"text": "📊 全节点安全总报", "callback_data": "act:daily_all"}
+        ])
+        btn_rows.append([
+            {"text": "➕ 添加新 VPS 节点", "callback_data": "act:add_prompt"},
+            {"text": "🔙 返回主控制台", "callback_data": "nav:home"}
+        ])
+
+        hint_text = (
+            f"\n\n━━━━━━━━━━━━━━━━━━\n"
+            f"💡 <i>点击下方对应 VPS 按钮，进入专属控制台（单机巡检、改名、日报与移除）。</i>"
+        )
+
         text = (
-            f"📋 <b>已纳管 VPS 列表 ({len(nodes)} 台)</b>\n"
+            f"📋 <b>已纳管 VPS 列表 (共 <code>{total_count}</code> 台)</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"{body}"
-            f"{hint}\n\n"
-            f"💡 <i>可点击下方按钮对指定 VPS 发起巡检或移除纳管。</i>"
+            f"{hint_text}"
         )
-        kb = {
-            "inline_keyboard": [
-                *btn_rows,
-                [
-                    {"text": "➕ 添加新 VPS 节点", "callback_data": "act:add_prompt"},
-                    {"text": "🔙 返回主菜单", "callback_data": "nav:home"}
-                ]
+        kb = {"inline_keyboard": btn_rows}
+        if msg_id:
+            self.edit_msg(chat_id, msg_id, text, reply_markup=kb)
+        else:
+            self.send_msg(chat_id, text, reply_markup=kb)
+
+    def show_node_detail(self, chat_id, idx, msg_id=None):
+        nodes = load_nodes()
+        if not (0 <= idx < len(nodes)):
+            self.send_msg(chat_id, "❌ 节点序号不存在！")
+            self.show_nodes_menu(chat_id, msg_id)
+            return
+
+        target = nodes[idx]
+        name = target.get("name", "未命名")
+        host = target.get("host", "")
+        port = target.get("port", 22)
+        user = target.get("user", "root")
+        is_local = target.get("is_local", False)
+        os_name = target.get("os", "Linux")
+        created = target.get("created_at", "未知")
+
+        role_str = "主控节点 (中央控制台)" if is_local else "受控子节点 (被控守护端)"
+
+        # 快速探测网络延迟 (1.5秒超时)
+        t0 = time.time()
+        latency = None
+        try:
+            s = socket.create_connection((host, port), timeout=1.5)
+            latency = (time.time() - t0) * 1000.0
+            s.close()
+        except Exception:
+            pass
+        lat_str = f"🟢 正常在线 (延迟 <code>{latency:.1f} ms</code>)" if latency is not None else "🔴 无法连接 (离线或超时)"
+
+        text = (
+            f"🖥️ <b>VPS 节点详情 · 【{html_escape(name)}】</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🏷️ <b>节点名称</b>: <code>{html_escape(name)}</code>\n"
+            f"🌐 <b>网络地址</b>: <code>{user}@{host}:{port}</code>\n"
+            f"📌 <b>节点角色</b>: <code>{role_str}</code>\n"
+            f"💻 <b>操作系统</b>: <code>{html_escape(os_name)}</code>\n"
+            f"📡 <b>实时网络</b>: {lat_str}\n"
+            f"🛡️ <b>防护引擎</b>: 🟢 Systemd 守护进程常驻保活 (秒级检测)\n"
+            f"📦 <b>纳管时间</b>: <code>{created}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"💡 <i>可在下方对当前 VPS 执行专属操作：</i>"
+        )
+
+        detail_buttons = [
+            [
+                {"text": "🔍 即时突发巡检", "callback_data": f"act:chk_node:{idx}"},
+                {"text": "📊 专属安全日报", "callback_data": f"act:day_node:{idx}"}
+            ],
+            [
+                {"text": "✏️ 修改节点别名", "callback_data": f"act:ren_node:{idx}"}
             ]
-        }
+        ]
+        if not is_local:
+            detail_buttons[1].append({"text": "🗑️ 移除此节点", "callback_data": f"act:del_node:{idx}"})
+
+        detail_buttons.append([
+            {"text": "🔙 返回节点列表", "callback_data": "nav:nodes"},
+            {"text": "🏠 返回主控制台", "callback_data": "nav:home"}
+        ])
+
+        kb = {"inline_keyboard": detail_buttons}
         if msg_id:
             self.edit_msg(chat_id, msg_id, text, reply_markup=kb)
         else:
@@ -1151,7 +1217,7 @@ class SecurityBot:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def delete_node(self, chat_id, node_idx):
+    def delete_node(self, chat_id, node_idx, msg_id=None):
         nodes = load_nodes()
         if 0 <= node_idx < len(nodes):
             target = nodes[node_idx]
@@ -1161,7 +1227,7 @@ class SecurityBot:
             removed = nodes.pop(node_idx)
             save_nodes(nodes)
             self.send_msg(chat_id, f"🗑️ 已成功从监控列表中移除节点: <b>{html_escape(removed.get('name'))}</b>")
-            self.show_nodes_menu(chat_id)
+            self.show_nodes_menu(chat_id, msg_id)
         else:
             self.send_msg(chat_id, "节点序号无效！")
 
@@ -1263,9 +1329,12 @@ class SecurityBot:
                     f"新名称: <b>{html_escape(new_name)}</b>"
                 )
                 self.show_nodes_menu(chat_id)
+        elif data.startswith("act:node_detail:"):
+            idx = int(data.split(":")[-1])
+            self.show_node_detail(chat_id, idx, msg_id)
         elif data.startswith("act:del_node:"):
             idx = int(data.split(":")[-1])
-            self.delete_node(chat_id, idx)
+            self.delete_node(chat_id, idx, msg_id)
 
     def handle_message(self, msg):
         from_user = msg.get("from", {})
