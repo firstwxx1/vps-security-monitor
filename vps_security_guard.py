@@ -600,9 +600,12 @@ def run_check_mode(cfg):
         friendly_site = site_names.get(host, host)
         site_display = f"{friendly_site} ({host})" if friendly_site != host else host
 
-        # 组装 1:1 格式告警消息
+        # 组装 1:1 格式告警消息 (支持多 VPS 节点标识)
+        node_name = cfg.get("node_name", "")
+        node_tag = f" · [{node_name}]" if node_name else ""
+
         lines = []
-        lines.append(f"🔔 后台登录尝试拦截 ({distinct_ip_count} 个 IP 汇总)")
+        lines.append(f"🔔 后台登录尝试拦截{node_tag} ({distinct_ip_count} 个 IP 汇总)")
         lines.append(f"📊 共 {total_fails} 次失败，来自 {distinct_ip_count} 个 IP，涉及 1 个站点:")
         lines.append(f"· {site_display} {path} -> {status_str}")
         lines.append("")
@@ -721,9 +724,12 @@ def run_daily_mode(cfg):
     backup_status = check_backup_status(cfg)
     sys_stats = get_system_stats()
 
-    # 9. 组装 1:1 日报内容
+    # 9. 组装 1:1 日报内容 (支持多 VPS 节点标识)
+    node_name = cfg.get("node_name", "")
+    node_tag = f" · [{node_name}]" if node_name else ""
+
     lines = []
-    lines.append(f"🛡️ 安全日报 · {yesterday_str}")
+    lines.append(f"🛡️ 安全日报{node_tag} · {yesterday_str}")
     lines.append(f"🔎 扫描探测 {scan_count} 次 ({len(scan_ips)} 个IP)")
     lines.append(f"🔑 后台登录失败 {login_fail_count} 次 ({len(login_fail_ips)} 个IP)")
     lines.append(f"💻 SSH 撞密码 {ssh_fail_count} 次")

@@ -49,6 +49,7 @@ get_status() {
     TG_STATUS="${RED}未配置${PLAIN}"
     CRON_STATUS="${RED}未安装${PLAIN}"
     NGINX_STATUS="${RED}不存在${PLAIN}"
+    BOT_DAEMON_STATUS="${RED}未运行${PLAIN}"
 
     if [ -f "${CONFIG_FILE}" ]; then
         local token=$(python3 - "$CONFIG_FILE" << 'EOF'
@@ -82,6 +83,12 @@ EOF
 
     if crontab -l 2>/dev/null | grep -q "vps_security_guard.py"; then
         CRON_STATUS="${GREEN}已激活${PLAIN}"
+    fi
+
+    if systemctl is-active --quiet vps-security-bot 2>/dev/null; then
+        BOT_DAEMON_STATUS="${GREEN}🟢 运行中${PLAIN}"
+    elif pgrep -f "vps_security_bot.py" >/dev/null 2>&1; then
+        BOT_DAEMON_STATUS="${GREEN}🟢 运行中${PLAIN}"
     fi
 }
 
@@ -616,6 +623,63 @@ EOF
     read -n 1 -s -r -p "按任意键返回主菜单..."
 }
 
+# 管理 Telegram 交互机器人守护进程
+manage_bot_daemon() {
+    clear
+    echo -e "${CYAN}=====================================================${PLAIN}"
+    echo -e "${CYAN}         Telegram 交互管理机器人守护进程管理         ${PLAIN}"
+    echo -e "${CYAN}=====================================================${PLAIN}"
+    echo -e "说明："
+    echo -e "启动后，机器人将以守护进程在后台运行，支持："
+    echo -e "1. 在 Telegram 聊天中${GREEN}直接发送目标 VPS 的 SSH 账号密码${PLAIN}自动纳管并安装监控"
+    echo -e "2. 在 Telegram 点击按钮实时查看所有纳管 VPS 列表、在线状态与巡检"
+    echo -e "3. 一键生成专属接入命令，适配任意 Linux VPS"
+    echo ""
+    echo -e "当前状态: ${BOT_DAEMON_STATUS}"
+    echo ""
+    echo -e "  ${YELLOW}1.${PLAIN} 启动/重启 Telegram 机器人守护进程"
+    echo -e "  ${YELLOW}2.${PLAIN} 停止 Telegram 机器人守护进程"
+    echo -e "  ${YELLOW}3.${PLAIN} 查看机器人运行日志"
+    echo -e "  ${YELLOW}0.${PLAIN} 返回上一级"
+    echo ""
+    read -p "请选择操作 [0-3]: " b_opt
+    case "$b_opt" in
+        1)
+            # 确保 systemd 服务文件存在
+            cat << 'EOF' > /etc/systemd/system/vps-security-bot.service
+[Unit]
+Description=VPS Security Monitor Telegram Bot Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/vps-security-monitor
+ExecStart=/usr/bin/python3 /opt/vps-security-monitor/vps_security_bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            systemctl daemon-reload 2>/dev/null || true
+            systemctl enable vps-security-bot 2>/dev/null || true
+            systemctl restart vps-security-bot 2>/dev/null || true
+            echo -e "${GREEN}[+] 机器人守护进程已启动！你可以在 Telegram 中向 Bot 发送 /start 或发送远程 VPS 的 SSH 账号密码开始管理！${PLAIN}"
+            ;;
+        2)
+            systemctl stop vps-security-bot 2>/dev/null || true
+            pkill -f "vps_security_bot.py" || true
+            echo -e "${YELLOW}[+] 机器人守护进程已停止！${PLAIN}"
+            ;;
+        3)
+            echo -e "${CYAN}--- 最近 30 行日志 (Ctrl+C 退出) ---${PLAIN}"
+            journalctl -u vps-security-bot -n 30 --no-pager 2>/dev/null || true
+            ;;
+    esac
+    read -n 1 -s -r -p "按任意键返回..."
+}
+
 # 主菜单循环
 main_menu() {
     check_python
@@ -628,6 +692,7 @@ main_menu() {
         echo -e "${PURPLE}         🛡️  VPS 安全巡检与监控终端管理面板          ${PLAIN}"
         echo -e "${PURPLE}=====================================================${PLAIN}"
         echo -e " 机器人通知 : ${TG_STATUS}   Crontab 定时 : ${CRON_STATUS}"
+        echo -e " 机器人守护 : ${BOT_DAEMON_STATUS}"
         echo -e " Nginx 日志 : ${NGINX_STATUS}"
         echo -e "${PURPLE}-----------------------------------------------------${PLAIN}"
         echo -e " ${GREEN}1.${PLAIN} 配置 Telegram 报警通知机器人 (Token / Chat ID)"
@@ -636,26 +701,28 @@ main_menu() {
         echo -e " ${GREEN}4.${PLAIN} 配置 SSH 允许白名单 IP (陌生登录审计)"
         echo -e " ${GREEN}5.${PLAIN} 配置备份校验状态 (R2 / 本地目录 / 自定义命令)"
         echo -e "${PURPLE}-----------------------------------------------------${PLAIN}"
-        echo -e " ${CYAN}6.${PLAIN} 立即执行：突发攻击增量检测 (check)"
-        echo -e " ${CYAN}7.${PLAIN} 立即生成：全天安全日报 (daily)"
-        echo -e " ${CYAN}8.${PLAIN} 一键安装 / 更新 Crontab 定时任务"
-        echo -e " ${CYAN}9.${PLAIN} 一键卸载 Crontab 定时任务"
-        echo -e " ${CYAN}10.${PLAIN} 系统环境与日志排查自检"
+        echo -e " ${CYAN}6.${PLAIN} 🤖 管理 Telegram 交互机器人后台守护 (TG内一键加VPS)"
+        echo -e " ${CYAN}7.${PLAIN} 立即执行：突发攻击增量检测 (check)"
+        echo -e " ${CYAN}8.${PLAIN} 立即生成：全天安全日报 (daily)"
+        echo -e " ${CYAN}9.${PLAIN} 一键安装 / 更新 Crontab 定时任务"
+        echo -e " ${CYAN}10.${PLAIN} 一键卸载 Crontab 定时任务"
+        echo -e " ${CYAN}11.${PLAIN} 系统环境与日志排查自检"
         echo -e "${PURPLE}-----------------------------------------------------${PLAIN}"
         echo -e " ${YELLOW}0.${PLAIN} 退出管理菜单"
         echo -e "${PURPLE}=====================================================${PLAIN}"
-        read -p "请输入选项 [0-10]: " choice
+        read -p "请输入选项 [0-11]: " choice
         case "$choice" in
             1) config_telegram ;;
             2) config_paths ;;
             3) config_ssl ;;
             4) config_ssh_whitelist ;;
             5) config_backup ;;
-            6) run_manual_check ;;
-            7) run_manual_daily ;;
-            8) install_crontab ;;
-            9) uninstall_crontab ;;
-            10) diagnose_system ;;
+            6) manage_bot_daemon ;;
+            7) run_manual_check ;;
+            8) run_manual_daily ;;
+            9) install_crontab ;;
+            10) uninstall_crontab ;;
+            11) diagnose_system ;;
             0) clear; exit 0 ;;
             *) echo -e "${RED}输入无效，请重新输入！${PLAIN}"; sleep 1 ;;
         esac
