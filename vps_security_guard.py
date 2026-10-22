@@ -821,13 +821,91 @@ def run_daily_mode(cfg):
     send_telegram(cfg, msg)
 
 
+# ----------------- 保活与开机自启动模块 -----------------
+def get_uptime_info():
+    """获取系统运行时间描述与秒数"""
+    try:
+        with open("/proc/uptime", "r") as f:
+            total_seconds = float(f.readline().split()[0])
+            days = int(total_seconds // 86400)
+            hours = int((total_seconds % 86400) // 3600)
+            minutes = int((total_seconds % 3600) // 60)
+            parts = []
+            if days > 0:
+                parts.append(f"{days}天")
+            if hours > 0:
+                parts.append(f"{hours}小时")
+            parts.append(f"{minutes}分钟")
+            return ("".join(parts) if parts else "刚启动"), total_seconds
+    except Exception:
+        return "刚启动", 60.0
+
+
+def send_boot_notification(cfg):
+    """向 Telegram 发送 VPS 重启上线自启恢复通知"""
+    node_name = cfg.get("node_name", "本机 (主节点)")
+    uptime_desc, _ = get_uptime_info()
+    pub_ip = "127.0.0.1"
+    for u in ("https://api.ipify.org", "https://ifconfig.me/ip"):
+        try:
+            with urllib.request.urlopen(u, timeout=3) as r:
+                pub_ip = r.read().decode("utf-8").strip()
+                break
+        except Exception:
+            pass
+
+    text = (
+        f"🔄 <b>[VPS 重启上线自启通知]</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🏷️ <b>节点标识</b>: <code>{html_escape(node_name)}</code>\n"
+        f"🌐 <b>主机地址</b>: <code>{pub_ip}</code>\n"
+        f"⏱️ <b>开机运行</b>: <code>{uptime_desc}</code>\n"
+        f"🛡️ <b>保活守护</b>: 🟢 增量安全巡检与常驻自启服务已就绪\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"<i>该 VPS 重启完成，安全防护引擎已自启激活并持续保活！</i>"
+    )
+    send_telegram(cfg, text)
+    safe_print(f"[+] 开机自启通知已推送至 Telegram: {node_name} [{pub_ip}]")
+
+
+def run_daemon_mode(cfg):
+    """常驻后台保活守护进程：开机通知 + 每 60s 增量检测突发攻击 + 每天 09:00 安全日报"""
+    safe_print("[*] VPS 安全巡检常驻保活守护进程已启动...")
+    _, uptime_secs = get_uptime_info()
+    if uptime_secs < 300:
+        send_boot_notification(cfg)
+
+    last_daily_date = ""
+    while True:
+        try:
+            cfg = load_config()
+            # 1. 增量突发检测
+            run_check_mode(cfg, interactive=False)
+
+            # 2. 每日 09:00 日报检测
+            now = datetime.now()
+            today_str = now.strftime("%Y-%m-%d")
+            if now.hour == 9 and now.minute <= 5 and last_daily_date != today_str:
+                safe_print("[*] 触发 09:00 安全日报生成...")
+                run_daily_mode(cfg)
+                last_daily_date = today_str
+
+        except Exception as e:
+            safe_print(f"[-] 守护进程循环异常: {e}")
+
+        # 每 60 秒轮询一次
+        time.sleep(60)
+
+
 # ----------------- 命令行操作分发 -----------------
 def main():
     if len(sys.argv) < 2:
         print("VPS 安全巡检与监控引擎")
         print("用法:")
+        print("  python3 vps_security_guard.py daemon  # 常驻后台保活守护模式 (Systemd 守护/秒级即时拦截)")
         print("  python3 vps_security_guard.py check   # 增量突发攻击检测 (建议 Crontab 每 5 分钟)")
         print("  python3 vps_security_guard.py daily   # 24小时安全日报生成 (建议 Crontab 每天早晨 9:00)")
+        print("  python3 vps_security_guard.py boot    # 开机自启通知")
         print("  python3 vps_security_guard.py test    # 测试 Telegram 连接并发送测试通知")
         sys.exit(1)
 
@@ -839,6 +917,10 @@ def main():
         run_check_mode(cfg, interactive=interactive)
     elif cmd == "daily":
         run_daily_mode(cfg)
+    elif cmd == "boot":
+        send_boot_notification(cfg)
+    elif cmd == "daemon":
+        run_daemon_mode(cfg)
     elif cmd == "test":
         test_content = (
             "🔔 VPS 安全监控通知测试\n"

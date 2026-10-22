@@ -525,18 +525,21 @@ install_crontab() {
     echo -e "${CYAN}             一键配置 Crontab 巡检任务               ${PLAIN}"
     echo -e "${CYAN}=====================================================${PLAIN}"
     echo -e "即将添加的计划任务："
-    echo -e "  1. ${GREEN}*/5 * * * *${PLAIN} 突发拦截增量检测 (每 5 分钟扫描一次新攻击)"
-    echo -e "  2. ${GREEN}0 9 * * *${PLAIN}   每日安全日报 (每天早晨 09:00 推送全天汇总)"
+    echo -e "  1. ${GREEN}@reboot${PLAIN}       开机自启上线通知 (机器重启完成后第一时间推送)"
+    echo -e "  2. ${GREEN}*/5 * * * *${PLAIN} 突发拦截增量检测 (每 5 分钟扫描一次新攻击)"
+    echo -e "  3. ${GREEN}0 9 * * *${PLAIN}   每日安全日报 (每天早晨 09:00 推送全天汇总)"
     echo ""
     read -p "确认安装到当前用户的 Crontab 吗? (y/n) [y]: " confirm
     confirm=${confirm:-y}
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
         crontab -l 2>/dev/null | grep -v "vps_security_guard.py" > /tmp/cron_temp.txt || true
+        echo "@reboot /usr/bin/python3 ${GUARD_PY} boot >/dev/null 2>&1" >> /tmp/cron_temp.txt
         echo "*/5 * * * * /usr/bin/python3 ${GUARD_PY} check >/dev/null 2>&1" >> /tmp/cron_temp.txt
         echo "0 9 * * * /usr/bin/python3 ${GUARD_PY} daily >/dev/null 2>&1" >> /tmp/cron_temp.txt
         crontab /tmp/cron_temp.txt
         rm -f /tmp/cron_temp.txt
-        echo -e "${GREEN}[+] 定时任务安装成功！${PLAIN}"
+        systemctl enable cron 2>/dev/null || systemctl enable cronie 2>/dev/null || true
+        echo -e "${GREEN}[+] 定时任务安装成功且已激活开机自启！${PLAIN}"
     fi
     echo ""
     read -n 1 -s -r -p "按任意键返回主菜单..."
@@ -717,11 +720,12 @@ EOF
         echo -e "${CYAN}-----------------------------------------------------${PLAIN}"
         echo -e "  ${YELLOW}1.${PLAIN} 快速录入新 VPS 节点 (输入 IP / 别名)"
         echo -e "  ${YELLOW}2.${PLAIN} 移除已有 VPS 节点"
-        echo -e "  ${YELLOW}3.${PLAIN} 获取专属一键安装命令 (在目标 VPS 终端执行全自动接入)"
-        echo -e "  ${YELLOW}4.${PLAIN} 立即发起突发安全巡检"
+        echo -e "  ${YELLOW}3.${PLAIN} ✏️ 修改 VPS 节点名称 / 别名"
+        echo -e "  ${YELLOW}4.${PLAIN} 获取专属一键安装命令 (在目标 VPS 终端执行全自动接入)"
+        echo -e "  ${YELLOW}5.${PLAIN} 立即发起突发安全巡检"
         echo -e "  ${YELLOW}0.${PLAIN} 返回主菜单"
         echo ""
-        read -p "请输入选项 [0-4]: " n_opt
+        read -p "请输入选项 [0-5]: " n_opt
         case "$n_opt" in
             1)
                 echo ""
@@ -793,6 +797,47 @@ EOF
                 sleep 1.5
                 ;;
             3)
+                read -p "请输入要修改名称的节点序号: " ren_idx
+                if [ -n "$ren_idx" ]; then
+                    read -p "请输入该节点的新名称/别名 (如 阿里云香港): " new_node_name
+                    if [ -n "$new_node_name" ]; then
+                        python3 - "${SCRIPT_DIR}/nodes.json" "${SCRIPT_DIR}/config.json" "$ren_idx" "$new_node_name" << 'EOF'
+import sys, os, json
+
+nodes_file = sys.argv[1]
+cfg_file = sys.argv[2]
+try:
+    idx = int(sys.argv[3]) - 1
+    new_name = sys.argv[4].strip()
+    with open(nodes_file, 'r', encoding='utf-8') as f:
+        nodes = json.load(f)
+    if 0 <= idx < len(nodes):
+        old_name = nodes[idx].get("name")
+        host = nodes[idx].get("host", "")
+        display = f"{new_name} ({host})" if (host and host not in new_name and not nodes[idx].get("is_local")) else new_name
+        nodes[idx]["name"] = display
+        with open(nodes_file, 'w', encoding='utf-8') as f:
+            json.dump(nodes, f, ensure_ascii=False, indent=2)
+        if nodes[idx].get("is_local"):
+            try:
+                with open(cfg_file, 'r', encoding='utf-8') as cf:
+                    cfg = json.load(cf)
+                cfg["node_name"] = new_name
+                with open(cfg_file, 'w', encoding='utf-8') as cf:
+                    json.dump(cfg, cf, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+        print(f"[+] 节点名称成功修改为: {display}")
+    else:
+        print("[-] 节点序号不存在！")
+except Exception as e:
+    print(f"[-] 修改失败: {e}")
+EOF
+                    fi
+                fi
+                sleep 1.5
+                ;;
+            4)
                 clear
                 echo -e "${CYAN}=====================================================${PLAIN}"
                 echo -e "${CYAN}             ⚡ 专属一键安装接入命令                  ${PLAIN}"
@@ -826,7 +871,7 @@ EOF
                 echo ""
                 read -n 1 -s -r -p "按任意键返回..."
                 ;;
-            4)
+            5)
                 echo -e "${YELLOW}[*] 正在执行突发安全巡检...${PLAIN}"
                 python3 "${SCRIPT_DIR}/vps_security_guard.py" check --interactive
                 echo ""

@@ -218,15 +218,41 @@ fi
 
 # 6. 如果是无人值守自动安装模式 (--auto)
 if [ "$AUTO_MODE" = true ]; then
-    # 自动配置 Crontab 定时任务 (每5分钟突发检测 + 每天早晨09:00安全日报)
+    # 自动配置开机自启与定时保活 (@reboot 自启通知 + 5分钟突发检测 + 每天早晨09:00安全日报)
     crontab -l 2>/dev/null | grep -v "vps_security_guard.py" > /tmp/cron_temp.txt || true
+    echo "@reboot /usr/bin/python3 ${INSTALL_DIR}/vps_security_guard.py boot >/dev/null 2>&1" >> /tmp/cron_temp.txt
     echo "*/5 * * * * /usr/bin/python3 ${INSTALL_DIR}/vps_security_guard.py check >/dev/null 2>&1" >> /tmp/cron_temp.txt
     echo "0 9 * * * /usr/bin/python3 ${INSTALL_DIR}/vps_security_guard.py daily >/dev/null 2>&1" >> /tmp/cron_temp.txt
     crontab /tmp/cron_temp.txt
     rm -f /tmp/cron_temp.txt
 
-    # 确保 cron 服务启动
+    # 启用 Cron 服务开机自启动
+    systemctl enable cron 2>/dev/null || systemctl enable cronie 2>/dev/null || chkconfig crond on 2>/dev/null || rc-update add crond default 2>/dev/null || true
     systemctl restart cron 2>/dev/null || systemctl restart cronie 2>/dev/null || service cron restart 2>/dev/null || service crond restart 2>/dev/null || true
+
+    # 配置 Systemd 常驻守护进程与崩溃自愈保活 (vps-security-guard.service)
+    if command -v systemctl >/dev/null 2>&1; then
+        cat << 'EOF_SVC' > /etc/systemd/system/vps-security-guard.service
+[Unit]
+Description=VPS Security Monitor Guard Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/vps-security-monitor
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/vps-security-monitor/vps_security_guard.py daemon
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF_SVC
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl enable vps-security-guard.service 2>/dev/null || true
+        systemctl restart vps-security-guard.service 2>/dev/null || true
+    fi
 
     # 如果传入了 Token，执行向主控端自动入库并推送 Telegram
     if [ -n "$CLI_TOKEN" ]; then

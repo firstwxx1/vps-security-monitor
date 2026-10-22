@@ -192,6 +192,37 @@ class SecurityBot:
         self._cached_public_ip = None
         self.reload()
         self.start_registration_server()
+        self.check_boot_notification()
+
+    def check_boot_notification(self):
+        """如果系统刚启动 (uptime < 300秒)，向管理员发送自启动上线通知"""
+        try:
+            with open("/proc/uptime", "r") as f:
+                uptime_secs = float(f.readline().split()[0])
+            if uptime_secs < 300 and self.chat_id and self.token:
+                days = int(uptime_secs // 86400)
+                hours = int((uptime_secs % 86400) // 3600)
+                minutes = int((uptime_secs % 3600) // 60)
+                parts = []
+                if days > 0:
+                    parts.append(f"{days}天")
+                if hours > 0:
+                    parts.append(f"{hours}小时")
+                parts.append(f"{minutes}分钟")
+                up_str = "".join(parts) if parts else "刚启动"
+                pub_ip = self.get_public_ip()
+                boot_text = (
+                    f"🔄 <b>[主控服务器重启上线通知]</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"🏷️ <b>主机标识</b>: <code>{pub_ip} (主控)</code>\n"
+                    f"⏱️ <b>开机运行</b>: <code>{up_str}</code>\n"
+                    f"🤖 <b>控制中心</b>: 🟢 Telegram 守护进程与多节点调度中心已自启恢复！\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"<i>所有受控节点守护与警报接收已全部就绪。</i>"
+                )
+                self.send_msg(self.chat_id, boot_text)
+        except Exception:
+            pass
 
     def get_public_ip(self):
         """获取并缓存主控机器的公网 IP"""
@@ -253,6 +284,7 @@ class SecurityBot:
         commands = [
             {"command": "start", "description": "唤出控制中心主菜单"},
             {"command": "nodes", "description": "查看已纳管VPS列表"},
+            {"command": "rename", "description": "修改VPS节点名称/别名"},
             {"command": "add", "description": "在TG中添加VPS节点"},
             {"command": "check", "description": "立即全节点突发巡检"},
             {"command": "daily", "description": "获取全节点安全日报"},
@@ -374,16 +406,22 @@ class SecurityBot:
             lines.append(f"<b>{idx + 1}. {html_escape(name)}</b>\n    └ {html_escape(tag)}")
 
             # 操作按钮行
+            clean_name = name.split("(")[0].strip() if "(" in name else name
+            short_name = clean_name[:8] if len(clean_name) > 8 else clean_name
             if is_local:
                 btn_rows.append([
-                    {"text": f"🔍 巡检: {name[:10]}", "callback_data": f"act:chk_node:{idx}"},
-                    {"text": f"📊 日报", "callback_data": f"act:day_node:{idx}"}
+                    {"text": f"🔍 巡检: {short_name}", "callback_data": f"act:chk_node:{idx}"},
+                    {"text": "📊 日报", "callback_data": f"act:day_node:{idx}"},
+                    {"text": "✏️ 改名", "callback_data": f"act:ren_node:{idx}"}
                 ])
             else:
                 btn_rows.append([
-                    {"text": f"🔍 巡检: {name[:8]}", "callback_data": f"act:chk_node:{idx}"},
-                    {"text": f"📊 日报", "callback_data": f"act:day_node:{idx}"},
-                    {"text": f"🗑️ 移除", "callback_data": f"act:del_node:{idx}"}
+                    {"text": f"🔍 巡检: {short_name}", "callback_data": f"act:chk_node:{idx}"},
+                    {"text": "📊 日报", "callback_data": f"act:day_node:{idx}"}
+                ])
+                btn_rows.append([
+                    {"text": f"✏️ 改名: {short_name}", "callback_data": f"act:ren_node:{idx}"},
+                    {"text": "🗑️ 移除", "callback_data": f"act:del_node:{idx}"}
                 ])
 
         body = "\n".join(lines) if lines else "暂无纳管节点"
@@ -414,6 +452,40 @@ class SecurityBot:
                     {"text": "➕ 添加新 VPS 节点", "callback_data": "act:add_prompt"},
                     {"text": "🔙 返回主菜单", "callback_data": "nav:home"}
                 ]
+            ]
+        }
+        if msg_id:
+            self.edit_msg(chat_id, msg_id, text, reply_markup=kb)
+        else:
+            self.send_msg(chat_id, text, reply_markup=kb)
+
+    def prompt_rename_node(self, chat_id, idx, msg_id=None):
+        nodes = load_nodes()
+        if not (0 <= idx < len(nodes)):
+            self.send_msg(chat_id, "❌ 节点序号无效！")
+            return
+        target = nodes[idx]
+        curr_name = target.get("name", "未命名")
+        host = target.get("host", "")
+
+        self.user_states[chat_id] = {
+            "state": "waiting_rename_node",
+            "node_idx": idx,
+            "orig_msg_id": msg_id
+        }
+        text = (
+            f"✏️ <b>修改 VPS 节点名称/别名</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🏷️ <b>当前名称</b>: <code>{html_escape(curr_name)}</code>\n"
+            f"🌐 <b>主机地址</b>: <code>{host}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"请直接在当前聊天窗口<b>回复该节点的新名称/别名</b>：\n"
+            f"例如回复：<code>香港阿里云</code> 或 <code>美西主力机</code>\n\n"
+            f"<i>如需取消修改，请点击下方按钮返回。</i>"
+        )
+        kb = {
+            "inline_keyboard": [
+                [{"text": "🔙 取消返回节点列表", "callback_data": "nav:nodes"}]
             ]
         }
         if msg_id:
@@ -928,6 +1000,9 @@ class SecurityBot:
         elif data.startswith("act:day_node:"):
             idx = int(data.split(":")[-1])
             self.run_node_daily(chat_id, node_idx=idx)
+        elif data.startswith("act:ren_node:"):
+            idx = int(data.split(":")[-1])
+            self.prompt_rename_node(chat_id, idx, msg_id)
         elif data.startswith("act:del_node:"):
             idx = int(data.split(":")[-1])
             self.delete_node(chat_id, idx)
@@ -969,6 +1044,86 @@ class SecurityBot:
             return
         elif text in ("/cmd", "一键命令", "⚡ 专属一键命令"):
             self.show_one_click_cmd(chat_id)
+            return
+
+        # 处理快捷改名指令 /rename 序号 新名称 或 /rename IP 新名称
+        if text.startswith("/rename") or text.startswith("/name") or text.startswith("改名"):
+            parts = text.split(maxsplit=2)
+            if len(parts) >= 3:
+                target_ident = parts[1].strip()
+                new_name = parts[2].strip()
+                nodes = load_nodes()
+                found_idx = None
+                if target_ident.isdigit():
+                    idx = int(target_ident) - 1
+                    if 0 <= idx < len(nodes):
+                        found_idx = idx
+                if found_idx is None:
+                    for i, n in enumerate(nodes):
+                        if n.get("host") == target_ident or target_ident in n.get("name", ""):
+                            found_idx = i
+                            break
+                if found_idx is not None:
+                    old_name = nodes[found_idx].get("name")
+                    host = nodes[found_idx].get("host", "")
+                    display_name = f"{new_name} ({host})" if (host and host not in new_name and not nodes[found_idx].get("is_local")) else new_name
+                    nodes[found_idx]["name"] = display_name
+                    save_nodes(nodes)
+                    if nodes[found_idx].get("is_local"):
+                        try:
+                            cfg = load_config()
+                            cfg["node_name"] = new_name
+                            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                                json.dump(cfg, f, ensure_ascii=False, indent=2)
+                        except Exception:
+                            pass
+                    self.send_msg(chat_id, f"✅ <b>节点已成功更名为</b>: <code>{html_escape(display_name)}</code>")
+                    self.show_nodes_menu(chat_id)
+                    return
+                else:
+                    self.send_msg(chat_id, f"❌ 未找到匹配的节点: <code>{html_escape(target_ident)}</code>")
+                    return
+            else:
+                self.send_msg(chat_id, "💡 <b>改名指令用法</b>:\n<code>/rename 序号 新名称</code>\n例如: <code>/rename 2 阿里云香港</code>")
+                return
+
+        # 如果处于等待改名状态
+        if current_state == "waiting_rename_node":
+            idx = state_data.get("node_idx")
+            new_name = text.strip()
+            self.user_states.pop(chat_id, None)
+
+            if not new_name:
+                self.send_msg(chat_id, "❌ 节点名称不能为空！")
+                self.show_nodes_menu(chat_id)
+                return
+
+            nodes = load_nodes()
+            if idx is not None and 0 <= idx < len(nodes):
+                old_name = nodes[idx].get("name")
+                host = nodes[idx].get("host", "")
+                display_name = f"{new_name} ({host})" if (host and host not in new_name and not nodes[idx].get("is_local")) else new_name
+                nodes[idx]["name"] = display_name
+                save_nodes(nodes)
+
+                if nodes[idx].get("is_local"):
+                    try:
+                        cfg = load_config()
+                        cfg["node_name"] = new_name
+                        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                            json.dump(cfg, f, ensure_ascii=False, indent=2)
+                    except Exception:
+                        pass
+
+                self.send_msg(
+                    chat_id,
+                    f"✅ <b>[VPS 节点更名成功！]</b>\n"
+                    f"原名称: <code>{html_escape(old_name)}</code>\n"
+                    f"新名称: <b>{html_escape(display_name)}</b>"
+                )
+                self.show_nodes_menu(chat_id)
+            else:
+                self.send_msg(chat_id, "❌ 节点序号无效！")
             return
 
         # 如果处于等待添加 VPS 状态，或者输入内容像 IP 凭据
