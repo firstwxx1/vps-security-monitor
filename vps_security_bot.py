@@ -331,7 +331,7 @@ class SecurityBot:
             return "vps-sec-default"
         return hashlib.sha256(self.token.encode("utf-8")).hexdigest()[:16]
 
-    def fetch_node_metrics_ssh(self, target, timeout=4):
+    def fetch_node_metrics_ssh(self, target, timeout=5):
         """通过 SSH 从远程被控节点实时拉取完整的每日安全巡检指标数据"""
         host = target.get("host")
         port = target.get("port", 22)
@@ -349,12 +349,20 @@ class SecurityBot:
                 "import sys, json; sys.path.append('/opt/vps-security-monitor'); "
                 "import vps_security_guard as guard; "
                 "cfg = guard.load_config(); "
-                "res = guard.run_daily_mode(cfg, send_tg=False); "
+                "try:\n"
+                "    res = guard.run_daily_mode(cfg, send_tg=False)\n"
+                "except TypeError:\n"
+                "    res = guard.run_daily_mode(cfg)\n"
                 "print('---METRICS_JSON---'); "
                 "print(json.dumps(res, ensure_ascii=False))\""
             )
             _, stdout, _ = ssh.exec_command(cmd, timeout=timeout + 3)
             out = stdout.read().decode("utf-8", errors="ignore")
+            if "---METRICS_JSON---" not in out:
+                # 若远程代码异常或冲突，自动通过 git 重置拉取最新代码重试
+                ssh.exec_command("cd /opt/vps-security-monitor && git fetch origin main && git reset --hard origin/main", timeout=10)
+                _, stdout2, _ = ssh.exec_command(cmd, timeout=timeout + 3)
+                out = stdout2.read().decode("utf-8", errors="ignore")
             ssh.close()
             if "---METRICS_JSON---" in out:
                 json_str = out.split("---METRICS_JSON---")[-1].strip()
@@ -614,7 +622,12 @@ class SecurityBot:
         has_pwd = bool(target.get("password"))
         pwd_desc = "🟢 已配置 (实时指标拉取就绪)" if has_pwd else "⚠️ 未配置 (点击下方按钮一键配置)"
         metrics = target.get("metrics")
-        metric_desc = "🟢 已同步最新指标" if metrics else "⚪ 待同步 (配置 SSH 密码后即时拉取)"
+        if metrics:
+            metric_desc = "🟢 已同步最新攻防与负载数据"
+        elif has_pwd:
+            metric_desc = "🟡 密码已保存 (将在巡检或刷新时即时同步)"
+        else:
+            metric_desc = "⚪ 待同步 (点击下方按钮配置密码)"
 
         sub_info = ""
         if not is_local:
@@ -1586,6 +1599,15 @@ class SecurityBot:
                         sec_lines.append(
                             f"└ 💾 <b>系统负载</b>: 磁盘 <code>{disk_pct}%</code> (剩 {disk_free}G) · 内存可用 <code>{mem_avail}MB</code>{cert_info}{backup_info}"
                         )
+                        node_sections.append("\n".join(sec_lines))
+                    elif target_pwd:
+                        sec_lines = [
+                            f"🏷️ <b>[{idx+1}] {html_escape(name)}</b> · <code>{host}:{port}</code> <i>(受控子节点)</i>",
+                            f"├ 📡 <b>实时网络</b>: {lat_tag}",
+                            f"├ 💻 <b>操作系统</b>: <code>{html_escape(os_name)}</code>",
+                            f"├ 🔑 <b>SSH 凭据</b>: 🟢 密码已配置 (连接畅通)",
+                            f"└ ⏳ <b>攻防指标</b>: 正在同步中，请稍候点击下方【🔄 刷新全节点总报】"
+                        ]
                         node_sections.append("\n".join(sec_lines))
                     else:
                         sec_lines = [

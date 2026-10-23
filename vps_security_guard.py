@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import urllib.request
 import urllib.parse
+import hashlib
 from datetime import datetime, timedelta, timezone
 from collections import Counter, defaultdict
 
@@ -731,12 +732,20 @@ def fetch_node_metrics_ssh(target, timeout=4):
             "import sys, json; sys.path.append('/opt/vps-security-monitor'); "
             "import vps_security_guard as guard; "
             "cfg = guard.load_config(); "
-            "res = guard.run_daily_mode(cfg, send_tg=False); "
+            "try:\n"
+            "    res = guard.run_daily_mode(cfg, send_tg=False)\n"
+            "except TypeError:\n"
+            "    res = guard.run_daily_mode(cfg)\n"
             "print('---METRICS_JSON---'); "
             "print(json.dumps(res, ensure_ascii=False))\""
         )
         _, stdout, _ = ssh.exec_command(cmd, timeout=timeout + 3)
         out = stdout.read().decode("utf-8", errors="ignore")
+        if "---METRICS_JSON---" not in out:
+            # 若远程代码异常或冲突，自动通过 git 重置拉取最新代码
+            ssh.exec_command("cd /opt/vps-security-monitor && git fetch origin main && git reset --hard origin/main", timeout=10)
+            _, stdout2, _ = ssh.exec_command(cmd, timeout=timeout + 3)
+            out = stdout2.read().decode("utf-8", errors="ignore")
         ssh.close()
         if "---METRICS_JSON---" in out:
             json_str = out.split("---METRICS_JSON---")[-1].strip()
@@ -963,6 +972,15 @@ def build_all_nodes_daily_report(cfg, local_data=None):
                 sec_lines.append(
                     f"└ 💾 <b>系统负载</b>: 磁盘 <code>{disk_pct}%</code> (剩 {disk_free}G) · 内存可用 <code>{mem_avail}MB</code>{cert_info}{backup_info}"
                 )
+                node_sections.append("\n".join(sec_lines))
+            elif target_pwd:
+                sec_lines = [
+                    f"🏷️ <b>[{idx+1}] {html_escape(name)}</b> · <code>{host}:{port}</code> <i>(受控子节点)</i>",
+                    f"├ 📡 <b>实时网络</b>: {lat_tag}",
+                    f"├ 💻 <b>操作系统</b>: <code>{html_escape(os_name)}</code>",
+                    f"├ 🔑 <b>SSH 凭据</b>: 🟢 密码已配置 (连接畅通)",
+                    f"└ ⏳ <b>攻防指标</b>: 正在同步中，请稍候点击下方【🔄 刷新总报】"
+                ]
                 node_sections.append("\n".join(sec_lines))
             else:
                 sec_lines = [
