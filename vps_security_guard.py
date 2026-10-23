@@ -589,7 +589,8 @@ def check_ssl_expiry(domain):
                 if proc.returncode == 0:
                     date_str = proc.stdout.decode().strip().split("=")[-1]
                     expire_date = datetime.strptime(date_str, "%b %d %H:%M:%S %Y %Z")
-                    days_left = (expire_date - datetime.utcnow()).days
+                    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+                    days_left = (expire_date - now_utc).days
                     return days_left
     except Exception:
         pass
