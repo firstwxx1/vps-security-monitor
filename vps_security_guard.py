@@ -714,6 +714,19 @@ def run_check_mode(cfg, interactive=False):
 
 
 # ----------------- 模式 B: 安全日报 (daily) 与全节点汇总 -----------------
+def get_public_ip():
+    """获取本机公网 IPv4 地址"""
+    for u in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"):
+        try:
+            with urllib.request.urlopen(u, timeout=3) as r:
+                ip_val = r.read().decode("utf-8").strip()
+                if re.match(r"^(\d{1,3}\.){3}\d{1,3}$", ip_val):
+                    return ip_val
+        except Exception:
+            pass
+    return "127.0.0.1"
+
+
 def fetch_node_metrics_ssh(target, timeout=4):
     """通过 SSH 从远程被控节点实时拉取完整的每日安全巡检指标数据"""
     host = target.get("host")
