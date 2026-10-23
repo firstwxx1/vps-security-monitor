@@ -740,6 +740,13 @@ def build_all_nodes_daily_report(cfg, local_data=None):
         is_local = target.get("is_local", False)
         os_name = target.get("os", "Linux")
 
+        # 针对本地主控，使用真实公网 IP 显示，避免显示 127.0.0.1
+        display_host = host
+        if is_local or host in ("127.0.0.1", "localhost"):
+            real_ip = local_data.get("public_ip") if local_data else None
+            if real_ip and real_ip not in ("127.0.0.1", "localhost"):
+                display_host = real_ip
+
         if is_local:
             try:
                 ssh_cnt = local_data.get("ssh_fail_count", 0)
@@ -761,16 +768,39 @@ def build_all_nodes_daily_report(cfg, local_data=None):
                     backup_info = f" · {local_data['backup_status']}"
 
                 sec_lines = [
-                    f"🏷️ <b>[{idx+1}] {html_escape(name)}</b> · <code>{host}</code> <i>(主控)</i>",
+                    f"🏷️ <b>[{idx+1}] {html_escape(name)}</b> · <code>{display_host}</code> <i>(主控)</i>",
                     f"├ 🖥️ <b>SSH防爆破</b>: 拦截 <code>{ssh_cnt:,}</code> 次 | 封禁中: <code>{banned_cnt}</code> 个",
                     f"├ 🌐 <b>Web扫描探测</b>: <code>{scan_cnt}</code> 次 | 登录失败: <code>{web_cnt}</code> 次",
                     f"├ ⚠️ <b>疑似陌生登录</b>: <code>{local_data.get('stranger_logins', 0)}</code> 次",
-                    f"└ 💾 <b>系统负载</b>: 磁盘 <code>{local_data.get('disk_percent')}%</code> (剩 {local_data.get('disk_free_gb')}G) · 内存可用 <code>{local_data.get('mem_avail_mb')}MB</code>{cert_info}{backup_info}"
                 ]
+
+                # 展示撞密码最多的 Top 恶意攻击源 IP
+                top_logins = local_data.get("top_login_details", [])
+                if top_logins:
+                    sec_lines.append("├ 🚨 <b>撞密码最多的来源 IP</b>:")
+                    for item in top_logins[:3]:
+                        ip_str = item.get("ip")
+                        cnt = item.get("count", 0)
+                        geo = item.get("geo", "未知")
+                        sec_lines.append(f"│  • <code>{ip_str}</code> ×{cnt} (<code>{html_escape(geo)}</code>)")
+
+                # 展示 Web 扫描探测最多的 Top 来源 IP
+                top_probes = local_data.get("top_probe_details", [])
+                if top_probes:
+                    sec_lines.append("├ 🔍 <b>扫描探测最多的来源 IP</b>:")
+                    for item in top_probes[:2]:
+                        ip_str = item.get("ip")
+                        cnt = item.get("count", 0)
+                        geo = item.get("geo", "未知")
+                        sec_lines.append(f"│  • <code>{ip_str}</code> ×{cnt} (<code>{html_escape(geo)}</code>)")
+
+                sec_lines.append(
+                    f"└ 💾 <b>系统负载</b>: 磁盘 <code>{local_data.get('disk_percent')}%</code> (剩 {local_data.get('disk_free_gb')}G) · 内存可用 <code>{local_data.get('mem_avail_mb')}MB</code>{cert_info}{backup_info}"
+                )
                 node_sections.append("\n".join(sec_lines))
             except Exception as e:
                 node_sections.append(
-                    f"🏷️ <b>[{idx+1}] {html_escape(name)}</b> · <code>{host}</code> <i>(主控)</i>\n"
+                    f"🏷️ <b>[{idx+1}] {html_escape(name)}</b> · <code>{display_host}</code> <i>(主控)</i>\n"
                     f"└ ❌ 获取本地数据异常: <code>{html_escape(str(e)[:30])}</code>"
                 )
         else:
@@ -953,15 +983,45 @@ def run_daily_mode(cfg, send_tg=True, force=False):
 
     lines.append(f"💽 磁盘已用 {sys_stats['disk_percent']}% (剩 {sys_stats['disk_free_gb']}G) · 内存可用 {sys_stats['mem_avail_mb']} MB")
 
+    # 构造 Top 撞密 IP 明细列表
+    top_login_details = []
+    for ip in top_login_ips:
+        cnt = total_login_fail_ips[ip]
+        geo = geo_map.get(ip, "未知归属地")
+        target_host = ip_to_host.get(ip, "")
+        top_login_details.append({"ip": ip, "count": cnt, "geo": geo, "host": target_host})
+
+    # 构造 Top 扫描探测 IP 明细列表
+    top_probe_details = []
+    for ip in top_probe_ips:
+        cnt = scan_ips[ip]
+        geo = geo_map.get(ip, "未知归属地")
+        top_probe_details.append({"ip": ip, "count": cnt, "geo": geo})
+
+    # 探测本机公网 IP (用于日报展示，避免显示 127.0.0.1)
+    pub_ip = "127.0.0.1"
+    for u in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"):
+        try:
+            with urllib.request.urlopen(u, timeout=3) as r:
+                ip_val = r.read().decode("utf-8").strip()
+                if re.match(r"^(\d{1,3}\.){3}\d{1,3}$", ip_val):
+                    pub_ip = ip_val
+                    break
+        except Exception:
+            pass
+
     msg = "\n".join(lines)
     local_result = {
         "msg": msg,
+        "public_ip": pub_ip,
         "scan_count": scan_count,
         "login_fail_count": login_fail_count,
         "ssh_fail_count": ssh_fail_count,
         "new_bans": f2b.get("today_total_bans", 0),
         "banned_count": f2b.get("banned_count", 0),
         "top_login_ips": top_login_ips,
+        "top_login_details": top_login_details,
+        "top_probe_details": top_probe_details,
         "stranger_logins": len(stranger_logins),
         "disk_percent": sys_stats.get("disk_percent", 0),
         "disk_free_gb": sys_stats.get("disk_free_gb", 0),

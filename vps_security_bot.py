@@ -1170,6 +1170,13 @@ class SecurityBot:
                 is_local = target.get("is_local", False)
                 os_name = target.get("os", "Linux")
 
+                # 针对本地主控，使用真实公网 IP 显示，避免显示 127.0.0.1
+                display_host = host
+                if is_local or host in ("127.0.0.1", "localhost"):
+                    real_ip = self.get_public_ip()
+                    if real_ip and real_ip not in ("127.0.0.1", "localhost"):
+                        display_host = real_ip
+
                 if is_local:
                     try:
                         import vps_security_guard as guard
@@ -1193,16 +1200,39 @@ class SecurityBot:
                             backup_info = f" · {data['backup_status']}"
 
                         sec_lines = [
-                            f"🏷️ <b>[{idx+1}] {html_escape(name)}</b> · <code>{host}</code> <i>(主控)</i>",
+                            f"🏷️ <b>[{idx+1}] {html_escape(name)}</b> · <code>{display_host}</code> <i>(主控)</i>",
                             f"├ 🖥️ <b>SSH防爆破</b>: 拦截 <code>{ssh_cnt:,}</code> 次 | 封禁中: <code>{banned_cnt}</code> 个",
                             f"├ 🌐 <b>Web扫描探测</b>: <code>{scan_cnt}</code> 次 | 登录失败: <code>{web_cnt}</code> 次",
                             f"├ ⚠️ <b>疑似陌生登录</b>: <code>{data.get('stranger_logins', 0)}</code> 次",
-                            f"└ 💾 <b>系统负载</b>: 磁盘 <code>{data.get('disk_percent')}%</code> (剩 {data.get('disk_free_gb')}G) · 内存可用 <code>{data.get('mem_avail_mb')}MB</code>{cert_info}{backup_info}"
                         ]
+
+                        # 展示撞密码最多的 Top 来源 IP
+                        top_logins = data.get("top_login_details", [])
+                        if top_logins:
+                            sec_lines.append("├ 🚨 <b>撞密码最多的来源 IP</b>:")
+                            for item in top_logins[:3]:
+                                ip_str = item.get("ip")
+                                cnt = item.get("count", 0)
+                                geo = item.get("geo", "未知")
+                                sec_lines.append(f"│  • <code>{ip_str}</code> ×{cnt} (<code>{html_escape(geo)}</code>)")
+
+                        # 展示 Web 扫描探测最多的 Top 来源 IP
+                        top_probes = data.get("top_probe_details", [])
+                        if top_probes:
+                            sec_lines.append("├ 🔍 <b>扫描探测最多的来源 IP</b>:")
+                            for item in top_probes[:2]:
+                                ip_str = item.get("ip")
+                                cnt = item.get("count", 0)
+                                geo = item.get("geo", "未知")
+                                sec_lines.append(f"│  • <code>{ip_str}</code> ×{cnt} (<code>{html_escape(geo)}</code>)")
+
+                        sec_lines.append(
+                            f"└ 💾 <b>系统负载</b>: 磁盘 <code>{data.get('disk_percent')}%</code> (剩 {data.get('disk_free_gb')}G) · 内存可用 <code>{data.get('mem_avail_mb')}MB</code>{cert_info}{backup_info}"
+                        )
                         node_sections.append("\n".join(sec_lines))
                     except Exception as e:
                         node_sections.append(
-                            f"🏷️ <b>[{idx+1}] {html_escape(name)}</b> · <code>{host}</code> <i>(主控)</i>\n"
+                            f"🏷️ <b>[{idx+1}] {html_escape(name)}</b> · <code>{display_host}</code> <i>(主控)</i>\n"
                             f"└ ❌ 获取本地数据异常: <code>{html_escape(str(e)[:30])}</code>"
                         )
                 else:
