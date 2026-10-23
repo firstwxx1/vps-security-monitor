@@ -539,8 +539,8 @@ def is_ip_whitelisted(ip, cfg=None):
     return False
 
 
-def ban_ip(ip, reason="恶意攻击", hits=1, duration_hours=24, cfg=None):
-    """封禁指定异常 IP 并加入 iptables VPS-BLOCK 链 (在内核层直接 DROP 丢弃)"""
+def ban_ip(ip, reason="恶意攻击", hits=1, duration_hours=0, cfg=None):
+    """封禁指定异常 IP 并加入 iptables VPS-BLOCK 链 (在内核层直接 DROP 丢弃，默认永久封禁)"""
     if is_ip_whitelisted(ip, cfg):
         return False, "IP 属于系统安全白名单或当前登录会话，已自动豁免"
     ensure_firewall_chain()
@@ -563,8 +563,9 @@ def ban_ip(ip, reason="恶意攻击", hits=1, duration_hours=24, cfg=None):
         "geo": geo
     }
     save_banned_ips(banned)
-    safe_print(f"[+] [防火墙阻断] 成功封禁恶意 IP: {ip} ({geo}) · 原因: {reason}")
-    return True, f"已成功封禁 {ip} ({geo})"
+    dur_str = "永久封禁" if duration_hours == 0 else f"{duration_hours}小时"
+    safe_print(f"[+] [防火墙阻断] 成功封禁恶意 IP: {ip} ({geo}) · 原因: {reason} [{dur_str}]")
+    return True, f"已成功封禁 {ip} ({geo}) [{dur_str}]"
 
 
 def unban_ip(ip):
@@ -588,10 +589,27 @@ def unban_ip(ip):
     return True, f"防火墙规则已清理: {ip}"
 
 
-def clean_expired_bans():
-    """自动解封到期的 IP (默认24小时)"""
+def clean_expired_bans(cfg=None):
+    """自动解封到期的 IP (若全局配置为 0 或永久封禁，则自动将历史存量 IP 升级为永久生效)"""
+    if cfg is None:
+        cfg = load_config()
+    default_hours = cfg.get("ban", {}).get("ban_duration_hours", 0)
     banned = load_banned_ips()
     now_ts = int(time.time())
+
+    # 若全局策略已切换为永久封禁 (0 小时)，将历史设置了到期时间的存量 IP 自动转为永久封禁
+    if default_hours == 0:
+        migrated = False
+        for ip, info in banned.items():
+            if info.get("expire_at", 0) > 0:
+                info["expire_at"] = 0
+                info["duration_hours"] = 0
+                migrated = True
+        if migrated:
+            save_banned_ips(banned)
+            safe_print("[+] 已将存量防火墙黑名单全部升级为【永久封禁】规则")
+        return 0
+
     expired = []
     for ip, info in banned.items():
         exp = info.get("expire_at", 0)
@@ -787,9 +805,10 @@ def run_check_mode(cfg, interactive=False):
     site_names = cfg.get("sites", {})
     node_name = cfg.get("node_name", "本机 (主节点)")
     ban_enabled = cfg.get("ban", {}).get("enabled", True)
-    ban_hours = cfg.get("ban", {}).get("ban_duration_hours", 24)
+    ban_thresh = cfg.get("ban", {}).get("max_failures", 5)
+    ban_hours = cfg.get("ban", {}).get("ban_duration_hours", 0)
 
-    # 1. 检测 SSH 暴力破解与实时自动封禁
+    # 1. 检测 SSH 暴力破解与实时自动永久封禁 (登录失败超过 5 次)
     ssh_lines = get_ssh_lines_recent(1)
     failed_ssh, _ = parse_ssh_lines(ssh_lines)
     ssh_ip_counts = Counter(s["ip"] for s in failed_ssh)
@@ -798,8 +817,8 @@ def run_check_mode(cfg, interactive=False):
     if ban_enabled:
         banned_now = load_banned_ips()
         for ip, count in ssh_ip_counts.items():
-            if count >= alert_thresh and ip not in banned_now:
-                ok, msg = ban_ip(ip, reason=f"SSH 撞密爆破 {count} 次", hits=count, duration_hours=ban_hours, cfg=cfg)
+            if count > ban_thresh and ip not in banned_now:
+                ok, msg = ban_ip(ip, reason=f"SSH 撞密爆破 {count} 次 (超限5次)", hits=count, duration_hours=ban_hours, cfg=cfg)
                 if ok:
                     geo = get_ip_geo_bulk([ip]).get(ip, "未知归属地")
                     auto_banned_alerts.append({"ip": ip, "count": count, "geo": geo, "type": "SSH 爆破"})
@@ -815,19 +834,21 @@ def run_check_mode(cfg, interactive=False):
             web_ip_counts = Counter(f["ip"] for f in failed_logins)
             banned_now = load_banned_ips()
             for ip, count in web_ip_counts.items():
-                if count >= alert_thresh and ip not in banned_now:
-                    ok, msg = ban_ip(ip, reason=f"Web 敏感后台尝试 {count} 次", hits=count, duration_hours=ban_hours, cfg=cfg)
+                if count > ban_thresh and ip not in banned_now:
+                    ok, msg = ban_ip(ip, reason=f"Web 敏感后台尝试 {count} 次 (超限5次)", hits=count, duration_hours=ban_hours, cfg=cfg)
                     if ok:
                         geo = get_ip_geo_bulk([ip]).get(ip, "未知归属地")
                         auto_banned_alerts.append({"ip": ip, "count": count, "geo": geo, "type": "Web 撞库"})
 
     # 若触发了新的防火墙自动封禁，发送实时阻断卡片
     if auto_banned_alerts:
+        dur_desc = "🔒 永久封禁 (直至管理员手动解封)" if ban_hours == 0 else f"{ban_hours} 小时 (到期自动解封)"
         b_lines = [
             f"🚫 <b>[防火墙高危攻击源自动拦截封禁] · [{html_escape(node_name)}]</b>",
             f"━━━━━━━━━━━━━━━━━━",
             f"🛡️ <b>防御引擎</b>: 🟢 Linux 内核防火墙 VPS-BLOCK 链 (DROP 丢弃)",
-            f"⏳ <b>封禁时长</b>: {ban_hours} 小时 (到期自动解封)",
+            f"⏳ <b>封禁时长</b>: <b>{dur_desc}</b>",
+            f"🚨 <b>触发规则</b>: 登录失败超过 <code>{ban_thresh}</code> 次自动阻断",
             f"📊 <b>本次封禁</b>: 共 <code>{len(auto_banned_alerts)}</code> 个恶意 IP",
             f"━━━━━━━━━━━━━━━━━━",
             f"📍 <b>被封禁恶意 IP 明细</b>:"
@@ -1278,13 +1299,13 @@ def run_daily_mode(cfg, send_tg=True, force=False):
     total_login_fail_ips.update(ssh_fail_ips)
     top_login_ips = [ip for ip, _ in total_login_fail_ips.most_common(5)]
 
-    # 4. 异常高频撞密与暴力破解 IP 自动加入防火墙封禁 (DROP)
+    # 4. 异常高频撞密与暴力破解 IP 自动加入防火墙永久封禁 (登录失败超过 5 次)
     if cfg.get("ban", {}).get("enabled", True):
-        ban_thresh = cfg.get("ban", {}).get("max_ssh_failures", 5)
-        ban_hrs = cfg.get("ban", {}).get("ban_duration_hours", 24)
+        ban_thresh = cfg.get("ban", {}).get("max_failures", 5)
+        ban_hrs = cfg.get("ban", {}).get("ban_duration_hours", 0)
         for ip, cnt in total_login_fail_ips.items():
-            if cnt >= ban_thresh:
-                ban_ip(ip, reason=f"SSH/Web 爆破尝试 {cnt} 次", hits=cnt, duration_hours=ban_hrs, cfg=cfg)
+            if cnt > ban_thresh:
+                ban_ip(ip, reason=f"SSH/Web 爆破尝试 {cnt} 次 (超限5次)", hits=cnt, duration_hours=ban_hrs, cfg=cfg)
 
     # 5. 防火墙与 Fail2ban 统计
     f2b = get_fail2ban_stats()
@@ -1586,11 +1607,11 @@ def main():
             print("[-] 测试失败，请检查配置文件中的 bot_token 与 chat_id。")
     elif cmd == "ban":
         if len(sys.argv) < 3:
-            print("用法: python3 vps_security_guard.py ban <IP> [时长(小时)] [原因]")
+            print("用法: python3 vps_security_guard.py ban <IP> [时长(小时, 0为永久)] [原因]")
             sys.exit(1)
         target_ip = sys.argv[2].strip()
-        hours = float(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].replace(".", "", 1).isdigit() else 24
-        reason = sys.argv[4].strip() if len(sys.argv) > 4 else "管理员手动封禁"
+        hours = float(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].replace(".", "", 1).isdigit() else 0
+        reason = sys.argv[4].strip() if len(sys.argv) > 4 else "管理员手动永久封禁"
         ok, msg = ban_ip(target_ip, reason=reason, duration_hours=hours, cfg=cfg)
         print(f"[{'+' if ok else '-'}] {msg}")
     elif cmd == "unban":
@@ -1601,23 +1622,24 @@ def main():
         ok, msg = unban_ip(target_ip)
         print(f"[{'+' if ok else '-'}] {msg}")
     elif cmd == "banned":
-        clean_expired_bans()
+        clean_expired_bans(cfg)
         banned = load_banned_ips()
         print(f"当前 VPS-BLOCK 防火墙链生效封禁: 共 {len(banned)} 个 IP")
         for ip, info in banned.items():
-            exp_sec = info.get("expire_at", 0) - time.time()
-            exp_str = f"剩 {exp_sec / 3600:.1f} 小时" if exp_sec > 0 else "永久"
+            exp_at = info.get("expire_at", 0)
+            exp_sec = exp_at - time.time() if exp_at > 0 else -1
+            exp_str = f"剩 {exp_sec / 3600:.1f} 小时" if exp_sec > 0 else "永久封禁"
             print(f"  • {ip} ({info.get('geo', '未知')}) | {info.get('reason', '')} | {exp_str}")
     elif cmd == "autoban":
-        ban_threshold = cfg.get("ban", {}).get("max_ssh_failures", 5)
-        ban_hours = cfg.get("ban", {}).get("ban_duration_hours", 24)
+        ban_threshold = cfg.get("ban", {}).get("max_failures", 5)
+        ban_hours = cfg.get("ban", {}).get("ban_duration_hours", 0)
         ssh_lines = get_ssh_lines_recent(24)
         failed_ssh, _ = parse_ssh_lines(ssh_lines)
         counts = Counter(it["ip"] for it in failed_ssh)
         banned_new = 0
         for ip, cnt in counts.items():
-            if cnt >= ban_threshold:
-                ok, _ = ban_ip(ip, reason=f"SSH 暴力破解 {cnt} 次", hits=cnt, duration_hours=ban_hours, cfg=cfg)
+            if cnt > ban_threshold:
+                ok, _ = ban_ip(ip, reason=f"SSH 暴力破解 {cnt} 次 (超限5次)", hits=cnt, duration_hours=ban_hours, cfg=cfg)
                 if ok:
                     banned_new += 1
         print(f"[+] 自动扫描封禁完成，新增封禁: {banned_new} 个恶意 IP，当前生效总封禁: {len(load_banned_ips())} 个")

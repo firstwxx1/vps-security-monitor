@@ -1688,7 +1688,7 @@ class SecurityBot:
         else:
             self.send_msg(chat_id, "节点序号无效！")
 
-    def ban_ip_everywhere(self, ip, hours=24, reason="管理员手动封禁"):
+    def ban_ip_everywhere(self, ip, hours=0, reason="管理员手动永久封禁"):
         """向本机及所有已纳管的 VPS 节点防火墙下发 IP 封禁指令 (iptables DROP)"""
         results = []
         # 1. 本机执行
@@ -1845,10 +1845,10 @@ class SecurityBot:
                 hits = info.get("hits", 1)
                 exp_at = info.get("expire_at", 0)
                 rem_sec = exp_at - time.time() if exp_at > 0 else -1
-                if rem_sec > 0:
+                if exp_at == 0:
+                    rem_str = "🔒 永久封禁"
+                elif rem_sec > 0:
                     rem_str = f"剩 {rem_sec / 3600:.1f}h"
-                elif exp_at == 0:
-                    rem_str = "永久封禁"
                 else:
                     rem_str = "即将解封"
 
@@ -2079,10 +2079,10 @@ class SecurityBot:
                 "🛑 <b>【手动封禁恶意 IP】</b>\n"
                 "━━━━━━━━━━━━━━━━━━\n"
                 "请直接在当前聊天窗口回复要封禁的 IP 地址，可附加时长与原因：\n\n"
-                "👉 格式：<code>IP [封禁小时数(默认24)] [原因]</code>\n"
-                "👉 范例：<code>103.205.248.51 48 恶意爆破SSH</code>\n"
-                "👉 或仅发送 IP：<code>103.205.248.51</code>\n\n"
-                "🛡️ <i>封禁规则将实时下发到本机及所有已纳管的远程 VPS 内核 iptables 中！</i>",
+                "👉 格式：<code>IP [封禁小时数(默认0为永久)] [原因]</code>\n"
+                "👉 范例：<code>103.205.248.51 恶意爆破SSH</code> (默认永久封禁)\n"
+                "👉 或指定时长：<code>103.205.248.51 48 临时封禁48小时</code>\n\n"
+                "🛡️ <i>封禁规则将实时下发到本机及所有已纳管远程 VPS 的 Linux 内核 iptables 中！</i>",
                 reply_markup={"inline_keyboard": [[{"text": "🔙 取消返回黑名单", "callback_data": "act:banned_list:1"}]]}
             )
 
@@ -2107,21 +2107,23 @@ class SecurityBot:
                 self.send_msg(chat_id, f"❌ 输入的 IP 格式不正确: <code>{html_escape(target_ip)}</code>")
                 self.show_banned_list(chat_id)
                 return
-            hours = 24
+            hours = 0
+            reason = "管理员手动永久封禁"
             if len(parts) >= 2:
-                try:
+                if parts[1].strip().replace(".", "", 1).isdigit():
                     hours = float(parts[1].strip())
-                except ValueError:
-                    hours = 24
-            reason = parts[2].strip() if len(parts) >= 3 else "管理员手动封禁"
+                    reason = parts[2].strip() if len(parts) >= 3 else "管理员手动封禁"
+                else:
+                    reason = " ".join(parts[1:])
             self.send_msg(chat_id, f"⏳ 正在向各 VPS 防火墙下发封禁指令: <code>{target_ip}</code>...")
             res_str = self.ban_ip_everywhere(target_ip, hours=hours, reason=reason)
+            dur_text = "🔒 永久封禁" if hours == 0 else f"<code>{hours}</code> 小时"
             self.send_msg(
                 chat_id,
                 f"🛑 <b>[防火墙 IP 封禁结果]</b>\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"🎯 <b>封禁目标</b>: <code>{target_ip}</code>\n"
-                f"⏳ <b>封禁时长</b>: <code>{hours}</code> 小时\n"
+                f"⏳ <b>封禁时长</b>: {dur_text}\n"
                 f"📝 <b>封禁原因</b>: {html_escape(reason)}\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"{res_str}"
@@ -2149,29 +2151,32 @@ class SecurityBot:
                 self.send_msg(
                     chat_id,
                     "💡 <b>/ban 用法</b>：\n"
-                    "<code>/ban &lt;IP&gt; [时长(小时)] [原因]</code>\n"
-                    "例如：<code>/ban 103.205.248.51 48 恶意爆破</code>"
+                    "<code>/ban &lt;IP&gt; [时长(小时, 0为永久)] [原因]</code>\n"
+                    "例如：<code>/ban 103.205.248.51</code> (默认永久封禁)\n"
+                    "或：<code>/ban 103.205.248.51 48 恶意爆破</code>"
                 )
                 return
             target_ip = parts[1].strip()
             if not re.match(r"^(\d{1,3}\.){3}\d{1,3}$", target_ip):
                 self.send_msg(chat_id, f"❌ 输入的 IP 格式不正确: <code>{html_escape(target_ip)}</code>")
                 return
-            hours = 24
+            hours = 0
+            reason = "管理员手动永久封禁"
             if len(parts) >= 3:
-                try:
+                if parts[2].strip().replace(".", "", 1).isdigit():
                     hours = float(parts[2].strip())
-                except ValueError:
-                    hours = 24
-            reason = parts[3].strip() if len(parts) >= 4 else "管理员手动封禁"
+                    reason = parts[3].strip() if len(parts) >= 4 else "管理员手动封禁"
+                else:
+                    reason = " ".join(parts[2:])
             self.send_msg(chat_id, f"⏳ 正在向各 VPS 防火墙下发封禁指令: <code>{target_ip}</code>...")
             res_str = self.ban_ip_everywhere(target_ip, hours=hours, reason=reason)
+            dur_text = "🔒 永久封禁" if hours == 0 else f"<code>{hours}</code> 小时"
             self.send_msg(
                 chat_id,
                 f"🛑 <b>[防火墙 IP 封禁结果]</b>\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"🎯 <b>封禁目标</b>: <code>{target_ip}</code>\n"
-                f"⏳ <b>封禁时长</b>: <code>{hours}</code> 小时\n"
+                f"⏳ <b>封禁时长</b>: {dur_text}\n"
                 f"📝 <b>封禁原因</b>: {html_escape(reason)}\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"{res_str}"

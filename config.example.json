@@ -25,6 +25,11 @@
     ],
     "alert_threshold_failures": 5
   },
+  "ban": {
+    "enabled": true,
+    "max_failures": 5,
+    "ban_duration_hours": 0
+  },
   "ssl_domains": [
     "gpt.isoziyuan.com",
     "tsc.ailxw.com"
