@@ -1358,19 +1358,19 @@ class SecurityBot:
                             f"🛡️ <b>[专属安全日报 · {html_escape(name)}]</b>",
                             f"━━━━━━━━━━━━━━━━━━",
                             f"🌐 <b>网络地址</b>: <code>{target_host}:{target_port}</code> <i>(受控子节点)</i>",
-                            f"├ 🖥️ <b>SSH防爆破</b>: 拦截 <code>{ssh_cnt:,}</code> 次 | 封禁中: <code>{banned_cnt}</code> 个",
+                            f"├ 🖥️ <b>SSH防爆破</b>: 拦截 <code>{ssh_cnt:,}</code> 次 | 🚫 <b>永久封禁中</b>: <code>{banned_cnt}</code> 个",
                             f"├ 🌐 <b>Web扫描探测</b>: <code>{scan_cnt}</code> 次 | 登录失败: <code>{web_cnt}</code> 次",
                             f"├ ⚠️ <b>疑似陌生登录</b>: <code>{metrics.get('stranger_logins', 0)}</code> 次",
                         ]
 
                         top_logins = metrics.get("top_login_details", [])
                         if top_logins:
-                            sec_lines.append("├ 🚨 <b>撞密码最多的来源 IP</b>:")
-                            for item in top_logins[:3]:
+                            sec_lines.append("├ 🚨 <b>攻击频率最高的恶意 IP (Top)</b>:")
+                            for item in top_logins[:5]:
                                 ip_str = item.get("ip")
                                 cnt = item.get("count", 0)
                                 geo = item.get("geo", "未知")
-                                sec_lines.append(f"│  • <code>{ip_str}</code> ×{cnt} (<code>{html_escape(geo)}</code>)")
+                                sec_lines.append(f"│  • <code>{ip_str}</code> ×{cnt:,} 次 (<code>{html_escape(geo)}</code>)")
 
                         top_probes = metrics.get("top_probe_details", [])
                         if top_probes:
@@ -1587,19 +1587,19 @@ class SecurityBot:
 
                         sec_lines = [
                             f"🏷️ <b>[{idx+1}] {html_escape(name)}</b> · <code>{host}</code> <i>(受控子节点)</i>",
-                            f"├ 🖥️ <b>SSH防爆破</b>: 拦截 <code>{ssh_cnt:,}</code> 次 | 封禁中: <code>{banned_cnt}</code> 个",
+                            f"├ 🖥️ <b>SSH防爆破</b>: 拦截 <code>{ssh_cnt:,}</code> 次 | 🚫 <b>永久封禁中</b>: <code>{banned_cnt}</code> 个",
                             f"├ 🌐 <b>Web扫描探测</b>: <code>{scan_cnt}</code> 次 | 登录失败: <code>{web_cnt}</code> 次",
                             f"├ ⚠️ <b>疑似陌生登录</b>: <code>{metrics.get('stranger_logins', 0)}</code> 次",
                         ]
 
                         top_logins = metrics.get("top_login_details", [])
                         if top_logins:
-                            sec_lines.append("├ 🚨 <b>撞密码最多的来源 IP</b>:")
-                            for item in top_logins[:3]:
+                            sec_lines.append("├ 🚨 <b>攻击频率最高的恶意 IP (Top)</b>:")
+                            for item in top_logins[:5]:
                                 ip_str = item.get("ip")
                                 cnt = item.get("count", 0)
                                 geo = item.get("geo", "未知")
-                                sec_lines.append(f"│  • <code>{ip_str}</code> ×{cnt} (<code>{html_escape(geo)}</code>)")
+                                sec_lines.append(f"│  • <code>{ip_str}</code> ×{cnt:,} 次 (<code>{html_escape(geo)}</code>)")
 
                         top_probes = metrics.get("top_probe_details", [])
                         if top_probes:

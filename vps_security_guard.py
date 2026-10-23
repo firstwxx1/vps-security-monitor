@@ -840,8 +840,8 @@ def run_check_mode(cfg, interactive=False):
                         geo = get_ip_geo_bulk([ip]).get(ip, "未知归属地")
                         auto_banned_alerts.append({"ip": ip, "count": count, "geo": geo, "type": "Web 撞库"})
 
-    # 若触发了新的防火墙自动封禁，发送实时阻断卡片
-    if auto_banned_alerts:
+    # 若触发了新的防火墙自动封禁 (默认静默阻断，不推送实时通知，避免刷屏；数量最多的由每日安全总报汇总展示)
+    if auto_banned_alerts and cfg.get("ban", {}).get("notify_on_ban", False):
         dur_desc = "🔒 永久封禁 (直至管理员手动解封)" if ban_hours == 0 else f"{ban_hours} 小时 (到期自动解封)"
         b_lines = [
             f"🚫 <b>[防火墙高危攻击源自动拦截封禁] · [{html_escape(node_name)}]</b>",
@@ -1347,29 +1347,20 @@ def run_daily_mode(cfg, send_tg=True, force=False):
     lines.append(f"🔑 后台登录失败 {login_fail_count} 次 ({len(login_fail_ips)} 个IP)")
     lines.append(f"💻 SSH 撞密码 {ssh_fail_count} 次")
 
-    if f2b["today_total_bans"] > 0:
-        lines.append(f"🚫 当天新封禁 {f2b['today_total_bans']} 个: {new_bans_str}")
-    else:
-        lines.append("🚫 当天新封禁 0 个")
-
-    if f2b["banned_count"] > 0:
-        if f2b["permanent_count"] > 0 or f2b["temp_count"] > 0:
-            lines.append(f"📦 当前封禁中: 永久 {f2b['permanent_count']} · 临时 {f2b['temp_count']}")
-        else:
-            lines.append(f"📦 当前封禁中: 共 {f2b['banned_count']} 个")
-    else:
-        lines.append("📦 当前封禁中: 0")
-
+    banned_now_dict = load_banned_ips()
+    total_banned = len(banned_now_dict)
+    today_banned = f2b.get("today_total_bans", 0)
+    lines.append(f"🚫 防火墙永久封禁: 当前共 {total_banned} 个恶意 IP (今日新增 {today_banned} 个)")
     lines.append("")
 
     if top_login_ips:
-        lines.append("撞密码最多的 IP:")
+        lines.append("🚨 攻击频率最高的恶意 IP (已阻断):")
         for ip in top_login_ips:
             cnt = total_login_fail_ips[ip]
             geo = geo_map.get(ip, "未知归属地")
             target_host = ip_to_host.get(ip, "")
             host_suffix = f" · {target_host}" if target_host else ""
-            lines.append(f"{ip} ×{cnt} · {geo}{host_suffix}")
+            lines.append(f"• {ip} ×{cnt:,} 次 ({geo}){host_suffix}")
         lines.append("")
 
     if top_probe_ips:

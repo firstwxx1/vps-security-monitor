@@ -28,7 +28,8 @@
   "ban": {
     "enabled": true,
     "max_failures": 5,
-    "ban_duration_hours": 0
+    "ban_duration_hours": 0,
+    "notify_on_ban": false
   },
   "ssl_domains": [
     "gpt.isoziyuan.com",
