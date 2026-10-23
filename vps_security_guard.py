@@ -26,7 +26,7 @@ import shutil
 import subprocess
 import urllib.request
 import urllib.parse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import Counter, defaultdict
 
 # ----------------- 路径与持久化文件 -----------------
@@ -34,6 +34,27 @@ SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
 GEO_CACHE_FILE = os.path.join(SCRIPT_DIR, "ip_geo_cache.json")
 STATE_FILE = os.path.join(SCRIPT_DIR, "monitor_state.json")
+NODES_FILE = os.path.join(SCRIPT_DIR, "nodes.json")
+
+def load_nodes():
+    """读取已纳管的全部 VPS 节点列表"""
+    if os.path.exists(NODES_FILE):
+        try:
+            with open(NODES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list) and len(data) > 0:
+                    return data
+        except Exception:
+            pass
+    return []
+
+def get_current_time(cfg=None):
+    """获取当前时区时间，默认为东八区 (Asia/Shanghai, UTC+8)，以确保日报在早晨 09:00 准时推送"""
+    tz_offset = 8
+    if cfg and isinstance(cfg, dict):
+        tz_offset = cfg.get("timezone_offset", 8)
+    utc_now = datetime.now(timezone.utc)
+    return utc_now + timedelta(hours=tz_offset)
 
 # 月份简写映射 (Nginx 日志与 SSH 日志使用)
 MONTH_MAP = {
@@ -88,8 +109,8 @@ def save_config(cfg):
 
 
 # ----------------- Telegram 消息推送 -----------------
-def send_telegram(cfg, message_text):
-    """通过 Telegram Bot 发送消息，使用纯文本避免转义字符报错"""
+def send_telegram(cfg, message_text, parse_mode="HTML"):
+    """通过 Telegram Bot 发送消息，默认使用 HTML 格式，若异常自动降级为纯文本"""
     bot_token = cfg.get("telegram", {}).get("bot_token", "").strip()
     chat_id = cfg.get("telegram", {}).get("chat_id", "").strip()
 
@@ -105,6 +126,9 @@ def send_telegram(cfg, message_text):
         "text": message_text,
         "disable_web_page_preview": True
     }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -115,6 +139,20 @@ def send_telegram(cfg, message_text):
         with urllib.request.urlopen(req, timeout=15) as resp:
             return resp.status == 200
     except Exception as e:
+        # 若因 HTML 标签解析失败返回 400，自动剥离 parse_mode 降级为纯文本重试
+        if parse_mode:
+            try:
+                payload.pop("parse_mode", None)
+                data_plain = json.dumps(payload).encode("utf-8")
+                req_plain = urllib.request.Request(
+                    url,
+                    data=data_plain,
+                    headers={"Content-Type": "application/json", "User-Agent": "VPS-Security-Guard/1.0"}
+                )
+                with urllib.request.urlopen(req_plain, timeout=15) as resp:
+                    return resp.status == 200
+            except Exception:
+                pass
         print(f"[-] Telegram 推送失败: {e}")
         return False
 
@@ -673,10 +711,107 @@ def run_check_mode(cfg, interactive=False):
         send_telegram(cfg, msg)
 
 
-# ----------------- 模式 B: 安全日报 (daily) -----------------
-def run_daily_mode(cfg, send_tg=True):
-    now = datetime.now()
-    yesterday_str = (now - timedelta(days=1)).strftime("%m月%d日")
+# ----------------- 模式 B: 安全日报 (daily) 与全节点汇总 -----------------
+def build_all_nodes_daily_report(cfg, local_data=None):
+    """将所有纳管的 VPS 节点（包括主机与后续添加的任意新节点）汇总为统一的全节点安全日报"""
+    nodes = load_nodes()
+    if not nodes:
+        return None
+
+    tz_offset = cfg.get("timezone_offset", 8)
+    now_tz = datetime.now(timezone.utc) + timedelta(hours=tz_offset)
+    yesterday_str = (now_tz - timedelta(days=1)).strftime("%m月%d日")
+    now_str = now_tz.strftime("%Y-%m-%d %H:%M:%S")
+
+    total_count = len(nodes)
+    node_sections = []
+    total_attacks = 0
+    total_bans = 0
+    online_count = 0
+
+    if local_data is None:
+        local_data = run_daily_mode(cfg, send_tg=False)
+
+    for idx, target in enumerate(nodes):
+        name = target.get("name", f"VPS-{idx+1}")
+        host = target.get("host", "127.0.0.1")
+        port = target.get("port", 22)
+        is_local = target.get("is_local", False)
+        os_name = target.get("os", "Linux")
+
+        if is_local:
+            try:
+                ssh_cnt = local_data.get("ssh_fail_count", 0)
+                scan_cnt = local_data.get("scan_count", 0)
+                web_cnt = local_data.get("login_fail_count", 0)
+                node_attacks = ssh_cnt + scan_cnt + web_cnt
+                total_attacks += node_attacks
+                banned_cnt = local_data.get("banned_count", 0)
+                total_bans += banned_cnt
+                online_count += 1
+
+                cert_info = ""
+                if local_data.get("nearest_cert"):
+                    dom, days = local_data["nearest_cert"]
+                    cert_info = f" · 证书剩 {days}天"
+
+                backup_info = ""
+                if local_data.get("backup_status"):
+                    backup_info = f" · {local_data['backup_status']}"
+
+                sec_lines = [
+                    f"🏷️ <b>[{idx+1}] {html_escape(name)}</b> · <code>{host}</code> <i>(主控)</i>",
+                    f"├ 🖥️ <b>SSH防爆破</b>: 拦截 <code>{ssh_cnt:,}</code> 次 | 封禁中: <code>{banned_cnt}</code> 个",
+                    f"├ 🌐 <b>Web扫描探测</b>: <code>{scan_cnt}</code> 次 | 登录失败: <code>{web_cnt}</code> 次",
+                    f"├ ⚠️ <b>疑似陌生登录</b>: <code>{local_data.get('stranger_logins', 0)}</code> 次",
+                    f"└ 💾 <b>系统负载</b>: 磁盘 <code>{local_data.get('disk_percent')}%</code> (剩 {local_data.get('disk_free_gb')}G) · 内存可用 <code>{local_data.get('mem_avail_mb')}MB</code>{cert_info}{backup_info}"
+                ]
+                node_sections.append("\n".join(sec_lines))
+            except Exception as e:
+                node_sections.append(
+                    f"🏷️ <b>[{idx+1}] {html_escape(name)}</b> · <code>{host}</code> <i>(主控)</i>\n"
+                    f"└ ❌ 获取本地数据异常: <code>{html_escape(str(e)[:30])}</code>"
+                )
+        else:
+            t0 = time.time()
+            latency = None
+            try:
+                s = socket.create_connection((host, port), timeout=3)
+                latency = (time.time() - t0) * 1000.0
+                s.close()
+                online_count += 1
+                lat_tag = f"🟢 在线正常 (延迟 <code>{latency:.1f}ms</code>)"
+            except Exception:
+                lat_tag = "🔴 无法连接 (离线或端口未通)"
+
+            sec_lines = [
+                f"🏷️ <b>[{idx+1}] {html_escape(name)}</b> · <code>{host}:{port}</code> <i>(受控子节点)</i>",
+                f"├ 📡 <b>实时网络</b>: {lat_tag}",
+                f"├ 💻 <b>操作系统</b>: <code>{html_escape(os_name)}</code>",
+                f"├ 🛡️ <b>防护引擎</b>: 🟢 Systemd 守护进程常驻保活 (秒级检测)",
+                f"└ ⏰ <b>告警审计</b>: 本地全天候自主阻断与开机重启自启通知"
+            ]
+            node_sections.append("\n".join(sec_lines))
+
+    nodes_body = "\n\n".join(node_sections)
+    final_report = (
+        f"📊 <b>[全节点安全巡检总报 · {yesterday_str}]</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📦 <b>纳管节点</b>: 共 <code>{total_count}</code> 台 | 🟢 <b>在线率</b>: <code>{online_count}/{total_count}</code>\n"
+        f"🛡️ <b>全网威胁</b>: 今日拦截黑客攻击探测共 <code>{total_attacks:,}</code> 次\n"
+        f"━━━━━━━━━━━━━━━━━━\n\n"
+        f"{nodes_body}\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💡 <i>提示：所有已纳管及未来新添加的 VPS 均已自动汇总于此总报中。</i>\n"
+        f"🕒 <b>生成时间</b>: <code>{now_str}</code>"
+    )
+    return final_report
+
+
+def run_daily_mode(cfg, send_tg=True, force=False):
+    tz_offset = cfg.get("timezone_offset", 8)
+    now_tz = datetime.now(timezone.utc) + timedelta(hours=tz_offset)
+    yesterday_str = (now_tz - timedelta(days=1)).strftime("%m月%d日")
 
     nginx_log = cfg.get("logs", {}).get("nginx_access_log", "/var/log/nginx/access.log")
     login_paths = cfg.get("security", {}).get("login_paths", [])
@@ -818,9 +953,7 @@ def run_daily_mode(cfg, send_tg=True):
     lines.append(f"💽 磁盘已用 {sys_stats['disk_percent']}% (剩 {sys_stats['disk_free_gb']}G) · 内存可用 {sys_stats['mem_avail_mb']} MB")
 
     msg = "\n".join(lines)
-    if send_tg:
-        send_telegram(cfg, msg)
-    return {
+    local_result = {
         "msg": msg,
         "scan_count": scan_count,
         "login_fail_count": login_fail_count,
@@ -835,6 +968,37 @@ def run_daily_mode(cfg, send_tg=True):
         "nearest_cert": nearest_cert,
         "backup_status": backup_status
     }
+
+    if not send_tg:
+        return local_result
+
+    # send_tg=True 模式：检测是否配置了纳管节点（主控模式）
+    nodes = load_nodes()
+    tz_offset = cfg.get("timezone_offset", 8)
+    now_tz = datetime.now(timezone.utc) + timedelta(hours=tz_offset)
+    today_str = now_tz.strftime("%Y-%m-%d")
+
+    state = load_state()
+    if not force and state.get("last_daily_sent_date") == today_str:
+        safe_print(f"[i] 今日全节点安全总报 ({today_str}) 已推送过，无需重复发送。如需重新发送请加 --force")
+        return local_result
+
+    if nodes and len(nodes) >= 1:
+        # 有多节点配置（主控端模式），生成并推送全节点总报
+        all_nodes_report = build_all_nodes_daily_report(cfg, local_data=local_result)
+        if all_nodes_report:
+            send_telegram(cfg, all_nodes_report, parse_mode="HTML")
+            state["last_daily_sent_date"] = today_str
+            save_state(state)
+            safe_print(f"[+] 全节点安全总报已成功推送至 Telegram (共 {len(nodes)} 台 VPS)")
+            return local_result
+
+    # 兜底：独立单机节点模式
+    send_telegram(cfg, msg, parse_mode=None)
+    state["last_daily_sent_date"] = today_str
+    save_state(state)
+    safe_print("[+] 单机安全日报已推送至 Telegram")
+    return local_result
 
 
 # ----------------- 保活与开机自启动模块 -----------------
@@ -898,13 +1062,21 @@ def run_daemon_mode(cfg):
             # 1. 增量突发检测
             run_check_mode(cfg, interactive=False)
 
-            # 2. 每日 09:00 日报检测
-            now = datetime.now()
-            today_str = now.strftime("%Y-%m-%d")
-            if now.hour == 9 and now.minute <= 5 and last_daily_date != today_str:
-                safe_print("[*] 触发 09:00 安全日报生成...")
-                run_daily_mode(cfg)
-                last_daily_date = today_str
+            # 2. 每日 09:00 日报检测 (采用东八区北京时间 UTC+8，确保准点推送)
+            tz_offset = cfg.get("timezone_offset", 8)
+            now_tz = datetime.now(timezone.utc) + timedelta(hours=tz_offset)
+            today_str = now_tz.strftime("%Y-%m-%d")
+            daily_hour = cfg.get("daily_hour", 9)
+            if now_tz.hour == daily_hour and now_tz.minute <= 5 and last_daily_date != today_str:
+                state = load_state()
+                if state.get("last_daily_sent_date") != today_str:
+                    safe_print(f"[*] 触发 {daily_hour:02d}:00 安全日报自动生成 (UTC+{tz_offset})...")
+                    state["last_daily_sent_date"] = today_str
+                    save_state(state)
+                    last_daily_date = today_str
+                    run_daily_mode(cfg, send_tg=True)
+                else:
+                    last_daily_date = today_str
 
         except Exception as e:
             safe_print(f"[-] 守护进程循环异常: {e}")
@@ -932,7 +1104,8 @@ def main():
         interactive = "--interactive" in sys.argv or "-i" in sys.argv
         run_check_mode(cfg, interactive=interactive)
     elif cmd == "daily":
-        run_daily_mode(cfg)
+        force = "--force" in sys.argv or "-f" in sys.argv
+        run_daily_mode(cfg, send_tg=True, force=force)
     elif cmd == "boot":
         send_boot_notification(cfg)
     elif cmd == "daemon":

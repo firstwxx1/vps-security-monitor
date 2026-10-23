@@ -30,6 +30,25 @@ SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
 NODES_FILE = os.path.join(SCRIPT_DIR, "nodes.json")
 GUARD_PY = os.path.join(SCRIPT_DIR, "vps_security_guard.py")
+STATE_FILE = os.path.join(SCRIPT_DIR, "monitor_state.json")
+
+
+def load_monitor_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_monitor_state(state):
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except Exception:
+        pass
 
 
 def load_config():
@@ -193,6 +212,34 @@ class SecurityBot:
         self.reload()
         self.start_registration_server()
         self.check_boot_notification()
+        # 启动每日早晨 09:00 全节点安全总报定时调度线程
+        threading.Thread(target=self.daily_scheduler_loop, daemon=True).start()
+
+    def daily_scheduler_loop(self):
+        """每日安全日报定时推送守护线程（默认每天早晨 09:00 北京时间自动汇总全节点安全总报推送）"""
+        print("[*] 每日安全总报定时调度线程已启动 (每天 09:00 CST 自动汇总推送)...", flush=True)
+        while True:
+            try:
+                cfg = load_config()
+                tz_offset = cfg.get("timezone_offset", 8)
+                now_tz = datetime.now(timezone.utc) + timedelta(hours=tz_offset)
+                today_str = now_tz.strftime("%Y-%m-%d")
+                daily_hour = cfg.get("daily_hour", 9)
+
+                # 每天 09:00 ~ 09:05 检测并自动汇总推送
+                if now_tz.hour == daily_hour and now_tz.minute <= 5:
+                    state = load_monitor_state()
+                    if state.get("last_daily_sent_date") != today_str:
+                        target_chat_id = self.chat_id or (self.admin_users[0] if self.admin_users else None)
+                        if target_chat_id:
+                            print(f"[*] 触发定时全节点安全总报自动推送: {today_str} {daily_hour:02d}:00 (时区 UTC+{tz_offset})...", flush=True)
+                            state["last_daily_sent_date"] = today_str
+                            save_monitor_state(state)
+                            self.run_daily_all(target_chat_id, is_auto=True)
+            except Exception as e:
+                print(f"[-] 每日安全总报定时调度异常: {e}", flush=True)
+
+            time.sleep(30)
 
     def check_boot_notification(self):
         """如果系统刚启动 (uptime < 300秒)，向管理员发送自启动上线通知"""
@@ -1084,27 +1131,32 @@ class SecurityBot:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def run_daily_all(self, chat_id, msg_id=None):
+    def run_daily_all(self, chat_id, msg_id=None, is_auto=False):
         """将所有纳管的 VPS 节点（包括后续新添加的任意节点）聚合汇聚为统一的单条全节点安全总报"""
         nodes = load_nodes()
         total_count = len(nodes)
 
-        init_text = (
-            f"📊 <b>[全节点安全总报生成中...]</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"📦 正在汇聚全部 <code>{total_count}</code> 台 VPS 节点的安全指标，请稍候 1~2 秒..."
-        )
-        if msg_id:
-            self.edit_msg(chat_id, msg_id, init_text)
-            target_msg_id = msg_id
-        else:
-            res = self.send_msg(chat_id, init_text)
-            target_msg_id = res.get("result", {}).get("message_id") if res else None
+        target_msg_id = None
+        if not is_auto:
+            init_text = (
+                f"📊 <b>[全节点安全总报生成中...]</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"📦 正在汇聚全部 <code>{total_count}</code> 台 VPS 节点的安全指标，请稍候 1~2 秒..."
+            )
+            if msg_id:
+                self.edit_msg(chat_id, msg_id, init_text)
+                target_msg_id = msg_id
+            else:
+                res = self.send_msg(chat_id, init_text)
+                target_msg_id = res.get("result", {}).get("message_id") if res else None
 
         def worker():
-            from datetime import timedelta
-            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            yesterday_str = (datetime.now() - timedelta(days=1)).strftime("%m月%d日")
+            from datetime import timedelta, timezone
+            cfg = load_config()
+            tz_offset = cfg.get("timezone_offset", 8)
+            now_tz = datetime.now(timezone.utc) + timedelta(hours=tz_offset)
+            now_str = now_tz.strftime("%Y-%m-%d %H:%M:%S")
+            yesterday_str = (now_tz - timedelta(days=1)).strftime("%m月%d日")
 
             node_sections = []
             total_attacks = 0
@@ -1121,7 +1173,6 @@ class SecurityBot:
                 if is_local:
                     try:
                         import vps_security_guard as guard
-                        cfg = load_config()
                         data = guard.run_daily_mode(cfg, send_tg=False)
                         ssh_cnt = data.get("ssh_fail_count", 0)
                         scan_cnt = data.get("scan_count", 0)
@@ -1202,6 +1253,11 @@ class SecurityBot:
                     ]
                 ]
             }
+
+            if is_auto:
+                state = load_monitor_state()
+                state["last_daily_sent_date"] = now_tz.strftime("%Y-%m-%d")
+                save_monitor_state(state)
 
             if target_msg_id:
                 self.edit_msg(chat_id, target_msg_id, final_report, reply_markup=kb)

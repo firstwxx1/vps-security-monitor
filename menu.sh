@@ -569,9 +569,9 @@ run_manual_check() {
 # 9. 立即生成全天安全日报
 run_manual_daily() {
     clear
-    echo -e "${CYAN}正在汇总过去 24 小时数据并生成安全日报 (daily 模式)...${PLAIN}"
-    python3 "${GUARD_PY}" daily
-    echo -e "${GREEN}[+] 日报已生成并推送到 Telegram！${PLAIN}"
+    echo -e "${CYAN}正在汇总全部 VPS 节点数据并生成全网安全日报 (daily 模式)...${PLAIN}"
+    python3 "${GUARD_PY}" daily --force
+    echo -e "${GREEN}[+] 全节点安全日报已生成并推送到 Telegram！${PLAIN}"
     read -n 1 -s -r -p "按任意键返回主菜单..."
 }
 
