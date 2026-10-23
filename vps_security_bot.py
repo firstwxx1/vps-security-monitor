@@ -31,6 +31,17 @@ CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
 NODES_FILE = os.path.join(SCRIPT_DIR, "nodes.json")
 GUARD_PY = os.path.join(SCRIPT_DIR, "vps_security_guard.py")
 STATE_FILE = os.path.join(SCRIPT_DIR, "monitor_state.json")
+BANNED_IPS_FILE = os.path.join(SCRIPT_DIR, "banned_ips.json")
+
+
+def load_local_banned_ips():
+    if os.path.exists(BANNED_IPS_FILE):
+        try:
+            with open(BANNED_IPS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
 
 
 def load_monitor_state():
@@ -401,7 +412,8 @@ class SecurityBot:
             "keyboard": [
                 [{"text": "➕ 添加 VPS 节点"}, {"text": "📋 VPS 节点列表"}],
                 [{"text": "🔍 立即全节点巡检"}, {"text": "📊 全节点安全日报"}],
-                [{"text": "⚡ 专属一键命令"}, {"text": "🔽 收起菜单"}]
+                [{"text": "🚫 防火墙黑名单"}, {"text": "⚡ 专属一键命令"}],
+                [{"text": "🔽 收起菜单"}]
             ],
             "resize_keyboard": True,
             "is_persistent": False
@@ -413,6 +425,7 @@ class SecurityBot:
             return
         commands = [
             {"command": "start", "description": "唤出控制中心主菜单"},
+            {"command": "banned", "description": "查看防火墙已封禁黑名单"},
             {"command": "nodes", "description": "查看已纳管VPS列表"},
             {"command": "rename", "description": "修改VPS节点名称/别名"},
             {"command": "add", "description": "在TG中添加VPS节点"},
@@ -509,10 +522,11 @@ class SecurityBot:
                     {"text": "📊 获取全节点安全日报", "callback_data": "act:daily_all"}
                 ],
                 [
-                    {"text": "⚡ 生成一键安装接入命令", "callback_data": "act:one_click_cmd"},
-                    {"text": "⌨️ 展开/唤出底部键盘", "callback_data": "act:show_reply_kb"}
+                    {"text": "🚫 防火墙已封禁黑名单", "callback_data": "act:banned_list:1"},
+                    {"text": "⚡ 专属一键安装接入命令", "callback_data": "act:one_click_cmd"}
                 ],
                 [
+                    {"text": "⌨️ 展开/唤出底部键盘", "callback_data": "act:show_reply_kb"},
                     {"text": "🔄 刷新控制面板", "callback_data": "nav:home"}
                 ]
             ]
@@ -569,7 +583,10 @@ class SecurityBot:
             {"text": "📊 全节点安全总报", "callback_data": "act:daily_all"}
         ])
         btn_rows.append([
-            {"text": "➕ 添加新 VPS 节点", "callback_data": "act:add_prompt"},
+            {"text": "🚫 防火墙已封禁黑名单", "callback_data": "act:banned_list:1"},
+            {"text": "➕ 添加新 VPS 节点", "callback_data": "act:add_prompt"}
+        ])
+        btn_rows.append([
             {"text": "🔙 返回主控制台", "callback_data": "nav:home"}
         ])
 
@@ -1671,6 +1688,207 @@ class SecurityBot:
         else:
             self.send_msg(chat_id, "节点序号无效！")
 
+    def ban_ip_everywhere(self, ip, hours=24, reason="管理员手动封禁"):
+        """向本机及所有已纳管的 VPS 节点防火墙下发 IP 封禁指令 (iptables DROP)"""
+        results = []
+        # 1. 本机执行
+        try:
+            cmd = [sys.executable, GUARD_PY, "ban", ip, str(hours), reason]
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+            local_out = res.stdout.strip()
+            results.append(f"🖥️ <b>本机 (主控)</b>: {html_escape(local_out)}")
+        except Exception as e:
+            results.append(f"🖥️ <b>本机 (主控)</b>: 执行异常 ({html_escape(str(e))})")
+
+        # 2. 远程节点执行
+        nodes = load_nodes()
+        for n in nodes:
+            if n.get("is_local"):
+                continue
+            host = n.get("host")
+            port = n.get("port", 22)
+            user = n.get("user", "root")
+            pwd = n.get("password")
+            name = n.get("name", host)
+            if pwd:
+                try:
+                    import paramiko
+                    ssh = paramiko.SSHClient()
+                    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                    ssh.connect(host, port=port, username=user, password=pwd, timeout=8)
+                    remote_cmd = f"python3 /opt/vps-security-monitor/vps_security_guard.py ban {ip} {hours} '{reason}'"
+                    _, stdout, _ = ssh.exec_command(remote_cmd, timeout=10)
+                    out = stdout.read().decode("utf-8", errors="ignore").strip()
+                    ssh.close()
+                    results.append(f"🖥️ <b>{html_escape(name)}</b>: {html_escape(out)}")
+                except Exception as e:
+                    results.append(f"🖥️ <b>{html_escape(name)}</b>: 同步失败 ({html_escape(str(e)[:25])})")
+            else:
+                results.append(f"🖥️ <b>{html_escape(name)}</b>: ⚠️ 未配置 SSH 密码，跳过同步")
+        return "\n".join(results)
+
+    def unban_ip_everywhere(self, ip):
+        """向本机及所有已纳管的 VPS 节点防火墙下发 IP 解封指令"""
+        results = []
+        # 1. 本机执行
+        try:
+            cmd = [sys.executable, GUARD_PY, "unban", ip]
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+            local_out = res.stdout.strip()
+            results.append(f"🖥️ <b>本机 (主控)</b>: {html_escape(local_out)}")
+        except Exception as e:
+            results.append(f"🖥️ <b>本机 (主控)</b>: 执行异常 ({html_escape(str(e))})")
+
+        # 2. 远程节点执行
+        nodes = load_nodes()
+        for n in nodes:
+            if n.get("is_local"):
+                continue
+            host = n.get("host")
+            port = n.get("port", 22)
+            user = n.get("user", "root")
+            pwd = n.get("password")
+            name = n.get("name", host)
+            if pwd:
+                try:
+                    import paramiko
+                    ssh = paramiko.SSHClient()
+                    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                    ssh.connect(host, port=port, username=user, password=pwd, timeout=8)
+                    remote_cmd = f"python3 /opt/vps-security-monitor/vps_security_guard.py unban {ip}"
+                    _, stdout, _ = ssh.exec_command(remote_cmd, timeout=10)
+                    out = stdout.read().decode("utf-8", errors="ignore").strip()
+                    ssh.close()
+                    results.append(f"🖥️ <b>{html_escape(name)}</b>: {html_escape(out)}")
+                except Exception as e:
+                    results.append(f"🖥️ <b>{html_escape(name)}</b>: 解封失败 ({html_escape(str(e)[:25])})")
+            else:
+                results.append(f"🖥️ <b>{html_escape(name)}</b>: ⚠️ 未配置 SSH 密码，跳过同步")
+        return "\n".join(results)
+
+    def autoban_everywhere(self):
+        """对本机及所有纳管的远程节点立即触发全量扫描与恶意 IP 防火墙封禁"""
+        results = []
+        # 1. 本机执行
+        try:
+            cmd = [sys.executable, GUARD_PY, "autoban"]
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20)
+            local_out = res.stdout.strip()
+            results.append(f"🖥️ <b>本机 (主控)</b>: {html_escape(local_out)}")
+        except Exception as e:
+            results.append(f"🖥️ <b>本机 (主控)</b>: 扫描异常 ({html_escape(str(e))})")
+
+        # 2. 远程节点执行
+        nodes = load_nodes()
+        for n in nodes:
+            if n.get("is_local"):
+                continue
+            host = n.get("host")
+            port = n.get("port", 22)
+            user = n.get("user", "root")
+            pwd = n.get("password")
+            name = n.get("name", host)
+            if pwd:
+                try:
+                    import paramiko
+                    ssh = paramiko.SSHClient()
+                    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                    ssh.connect(host, port=port, username=user, password=pwd, timeout=8)
+                    remote_cmd = "python3 /opt/vps-security-monitor/vps_security_guard.py autoban"
+                    _, stdout, _ = ssh.exec_command(remote_cmd, timeout=25)
+                    out = stdout.read().decode("utf-8", errors="ignore").strip()
+                    ssh.close()
+                    results.append(f"🖥️ <b>{html_escape(name)}</b>: {html_escape(out)}")
+                except Exception as e:
+                    results.append(f"🖥️ <b>{html_escape(name)}</b>: 扫描失败 ({html_escape(str(e)[:25])})")
+            else:
+                results.append(f"🖥️ <b>{html_escape(name)}</b>: ⚠️ 未配置 SSH 密码，跳过扫描")
+        return "\n".join(results)
+
+    def show_banned_list(self, chat_id, page=1, msg_id=None):
+        """展示防火墙拦截黑名单界面及一键解封操作"""
+        try:
+            subprocess.run([sys.executable, GUARD_PY, "banned"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        except Exception:
+            pass
+        banned = load_local_banned_ips()
+        total_banned = len(banned)
+
+        PAGE_SIZE = 5
+        total_pages = max(1, (total_banned + PAGE_SIZE - 1) // PAGE_SIZE)
+        if page < 1:
+            page = 1
+        elif page > total_pages:
+            page = total_pages
+
+        sorted_items = sorted(
+            banned.items(),
+            key=lambda item: item[1].get("banned_at", 0),
+            reverse=True
+        )
+        page_items = sorted_items[(page - 1) * PAGE_SIZE : page * PAGE_SIZE]
+
+        text_lines = [
+            "🚫 <b>防火墙拦截与黑名单管理中心</b>",
+            "━━━━━━━━━━━━━━━━━━",
+            "🛡️ <b>拦截机制</b>: Linux 内核级 iptables (VPS-BLOCK 链直接 DROP 丢弃)",
+            f"📊 <b>生效黑名单</b>: 共 <code>{total_banned}</code> 个恶意攻击 IP (第 {page}/{total_pages} 页)\n"
+        ]
+
+        btn_rows = []
+        if not page_items:
+            text_lines.append("<i>当前暂无封禁中的恶意 IP。</i>")
+        else:
+            for ip, info in page_items:
+                geo = info.get("geo", "未知归属地")
+                reason = info.get("reason", "恶意攻击")
+                hits = info.get("hits", 1)
+                exp_at = info.get("expire_at", 0)
+                rem_sec = exp_at - time.time() if exp_at > 0 else -1
+                if rem_sec > 0:
+                    rem_str = f"剩 {rem_sec / 3600:.1f}h"
+                elif exp_at == 0:
+                    rem_str = "永久封禁"
+                else:
+                    rem_str = "即将解封"
+
+                text_lines.append(
+                    f"🛑 <code>{ip}</code> ({html_escape(geo)})\n"
+                    f"    └ 🎯 原因: {html_escape(reason)} | 触发: <code>{hits}</code> 次 | ⏳ {rem_str}"
+                )
+                btn_rows.append([
+                    {"text": f"🔓 一键解封 {ip}", "callback_data": f"act:unban:{ip}:{page}"}
+                ])
+
+        nav_btns = []
+        if page > 1:
+            nav_btns.append({"text": "⬅️ 上一页", "callback_data": f"act:banned_list:{page - 1}"})
+        nav_btns.append({"text": f"📄 {page}/{total_pages}", "callback_data": f"act:banned_list:{page}"})
+        if page < total_pages:
+            nav_btns.append({"text": "下一页 ➡️", "callback_data": f"act:banned_list:{page + 1}"})
+        if nav_btns:
+            btn_rows.append(nav_btns)
+
+        btn_rows.append([
+            {"text": "⚡ 立即全量扫描封禁", "callback_data": f"act:autoban_now:{page}"},
+            {"text": "➕ 手动封禁 IP", "callback_data": "act:ban_prompt"}
+        ])
+        btn_rows.append([
+            {"text": "🔄 刷新黑名单", "callback_data": f"act:banned_list:{page}"},
+            {"text": "🔙 返回主控制台", "callback_data": "nav:home"}
+        ])
+
+        full_text = "\n".join(text_lines)
+        full_text += (
+            f"\n\n━━━━━━━━━━━━━━━━━━\n"
+            f"💡 <i>指令操作：发送 <code>/ban &lt;IP&gt; [小时] [原因]</code> 可直接封禁任意 IP；发送 <code>/unban &lt;IP&gt;</code> 可立即解封。</i>"
+        )
+        kb = {"inline_keyboard": btn_rows}
+        if msg_id:
+            self.edit_msg(chat_id, msg_id, full_text, reply_markup=kb)
+        else:
+            self.send_msg(chat_id, full_text, reply_markup=kb)
+
     # ---------------- 事件分发 ----------------
     def handle_callback(self, cb):
         cb_id = cb["id"]
@@ -1821,6 +2039,52 @@ class SecurityBot:
         elif data.startswith("act:del_node:"):
             idx = int(data.split(":")[-1])
             self.delete_node(chat_id, idx, msg_id)
+        elif data.startswith("act:banned_list"):
+            page = 1
+            parts = data.split(":")
+            if len(parts) >= 3 and parts[2].isdigit():
+                page = int(parts[2])
+            self.show_banned_list(chat_id, page=page, msg_id=msg_id)
+        elif data.startswith("act:unban:"):
+            parts = data.split(":")
+            target_ip = parts[2]
+            page = int(parts[3]) if len(parts) >= 4 and parts[3].isdigit() else 1
+            result_str = self.unban_ip_everywhere(target_ip)
+            self.send_msg(
+                chat_id,
+                f"🔓 <b>[防火墙 IP 解封结果]</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🎯 <b>解封目标</b>: <code>{target_ip}</code>\n"
+                f"{result_str}"
+            )
+            self.show_banned_list(chat_id, page=page, msg_id=None)
+        elif data.startswith("act:autoban_now"):
+            page = 1
+            parts = data.split(":")
+            if len(parts) >= 3 and parts[2].isdigit():
+                page = int(parts[2])
+            self.send_msg(chat_id, "⚡ <b>正在对全节点执行全量扫描与恶意 IP 防火墙封禁，请稍候...</b>")
+            result_str = self.autoban_everywhere()
+            self.send_msg(
+                chat_id,
+                f"⚡ <b>[全节点自动封禁扫描完成]</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"{result_str}"
+            )
+            self.show_banned_list(chat_id, page=page)
+        elif data == "act:ban_prompt":
+            self.user_states[chat_id] = {"state": "waiting_ban_ip", "orig_msg_id": msg_id}
+            self.edit_msg(
+                chat_id, msg_id,
+                "🛑 <b>【手动封禁恶意 IP】</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "请直接在当前聊天窗口回复要封禁的 IP 地址，可附加时长与原因：\n\n"
+                "👉 格式：<code>IP [封禁小时数(默认24)] [原因]</code>\n"
+                "👉 范例：<code>103.205.248.51 48 恶意爆破SSH</code>\n"
+                "👉 或仅发送 IP：<code>103.205.248.51</code>\n\n"
+                "🛡️ <i>封禁规则将实时下发到本机及所有已纳管的远程 VPS 内核 iptables 中！</i>",
+                reply_markup={"inline_keyboard": [[{"text": "🔙 取消返回黑名单", "callback_data": "act:banned_list:1"}]]}
+            )
 
     def handle_message(self, msg):
         from_user = msg.get("from", {})
@@ -1834,6 +2098,37 @@ class SecurityBot:
         state_data = self.user_states.get(chat_id, {})
         current_state = state_data.get("state")
 
+        # 处于手动封禁 IP 输入等待状态
+        if current_state == "waiting_ban_ip":
+            self.user_states.pop(chat_id, None)
+            parts = text.split(maxsplit=2)
+            target_ip = parts[0].strip()
+            if not re.match(r"^(\d{1,3}\.){3}\d{1,3}$", target_ip):
+                self.send_msg(chat_id, f"❌ 输入的 IP 格式不正确: <code>{html_escape(target_ip)}</code>")
+                self.show_banned_list(chat_id)
+                return
+            hours = 24
+            if len(parts) >= 2:
+                try:
+                    hours = float(parts[1].strip())
+                except ValueError:
+                    hours = 24
+            reason = parts[2].strip() if len(parts) >= 3 else "管理员手动封禁"
+            self.send_msg(chat_id, f"⏳ 正在向各 VPS 防火墙下发封禁指令: <code>{target_ip}</code>...")
+            res_str = self.ban_ip_everywhere(target_ip, hours=hours, reason=reason)
+            self.send_msg(
+                chat_id,
+                f"🛑 <b>[防火墙 IP 封禁结果]</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🎯 <b>封禁目标</b>: <code>{target_ip}</code>\n"
+                f"⏳ <b>封禁时长</b>: <code>{hours}</code> 小时\n"
+                f"📝 <b>封禁原因</b>: {html_escape(reason)}\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"{res_str}"
+            )
+            self.show_banned_list(chat_id)
+            return
+
         if text in ("/start", "/menu", "菜单", "🛡️ 唤出主控制台"):
             self.user_states.pop(chat_id, None)
             self.show_main_menu(chat_id)
@@ -1843,6 +2138,59 @@ class SecurityBot:
                 chat_id,
                 "⌨️ <b>底部快捷菜单已收起。</b>\n\n💡 随时可通过点击左下角 <b>【Menu】</b> 按钮或发送 <code>/start</code> 查看控制台！",
                 reply_markup={"remove_keyboard": True}
+            )
+            return
+        elif text in ("/banned", "黑名单", "封禁列表", "🚫 防火墙黑名单", "🚫 防火墙已封禁黑名单"):
+            self.show_banned_list(chat_id)
+            return
+        elif text.startswith("/ban"):
+            parts = text.split(maxsplit=3)
+            if len(parts) < 2:
+                self.send_msg(
+                    chat_id,
+                    "💡 <b>/ban 用法</b>：\n"
+                    "<code>/ban &lt;IP&gt; [时长(小时)] [原因]</code>\n"
+                    "例如：<code>/ban 103.205.248.51 48 恶意爆破</code>"
+                )
+                return
+            target_ip = parts[1].strip()
+            if not re.match(r"^(\d{1,3}\.){3}\d{1,3}$", target_ip):
+                self.send_msg(chat_id, f"❌ 输入的 IP 格式不正确: <code>{html_escape(target_ip)}</code>")
+                return
+            hours = 24
+            if len(parts) >= 3:
+                try:
+                    hours = float(parts[2].strip())
+                except ValueError:
+                    hours = 24
+            reason = parts[3].strip() if len(parts) >= 4 else "管理员手动封禁"
+            self.send_msg(chat_id, f"⏳ 正在向各 VPS 防火墙下发封禁指令: <code>{target_ip}</code>...")
+            res_str = self.ban_ip_everywhere(target_ip, hours=hours, reason=reason)
+            self.send_msg(
+                chat_id,
+                f"🛑 <b>[防火墙 IP 封禁结果]</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🎯 <b>封禁目标</b>: <code>{target_ip}</code>\n"
+                f"⏳ <b>封禁时长</b>: <code>{hours}</code> 小时\n"
+                f"📝 <b>封禁原因</b>: {html_escape(reason)}\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"{res_str}"
+            )
+            return
+        elif text.startswith("/unban"):
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2:
+                self.send_msg(chat_id, "💡 <b>/unban 用法</b>：\n<code>/unban &lt;IP&gt;</code>")
+                return
+            target_ip = parts[1].strip()
+            self.send_msg(chat_id, f"⏳ 正在从各 VPS 防火墙移除封禁: <code>{target_ip}</code>...")
+            res_str = self.unban_ip_everywhere(target_ip)
+            self.send_msg(
+                chat_id,
+                f"🔓 <b>[防火墙 IP 解封结果]</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🎯 <b>解封目标</b>: <code>{target_ip}</code>\n"
+                f"{res_str}"
             )
             return
         elif text in ("/nodes", "节点列表", "📋 VPS 节点列表"):

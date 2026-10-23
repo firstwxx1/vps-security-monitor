@@ -36,6 +36,7 @@ CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
 GEO_CACHE_FILE = os.path.join(SCRIPT_DIR, "ip_geo_cache.json")
 STATE_FILE = os.path.join(SCRIPT_DIR, "monitor_state.json")
 NODES_FILE = os.path.join(SCRIPT_DIR, "nodes.json")
+BANNED_IPS_FILE = os.path.join(SCRIPT_DIR, "banned_ips.json")
 
 def load_nodes():
     """读取已纳管的全部 VPS 节点列表"""
@@ -452,19 +453,199 @@ def parse_ssh_lines(lines):
     return failed_ssh, accepted_ssh
 
 
-# ----------------- Fail2ban 统计 -----------------
+# ----------------- 防火墙与异常 IP 封禁阻断引擎 (iptables VPS-BLOCK) -----------------
+def load_banned_ips():
+    """读取已封禁的 IP 列表"""
+    if os.path.exists(BANNED_IPS_FILE):
+        try:
+            with open(BANNED_IPS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_banned_ips(banned):
+    """保存已封禁的 IP 列表"""
+    try:
+        with open(BANNED_IPS_FILE, "w", encoding="utf-8") as f:
+            json.dump(banned, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        safe_print(f"[-] 保存封禁列表失败: {e}")
+
+
+def ensure_firewall_chain():
+    """确保 iptables VPS-BLOCK 独立防火墙链存在且位于 INPUT 规则第一条"""
+    try:
+        subprocess.run(["iptables", "-N", "VPS-BLOCK"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        check = subprocess.run(["iptables", "-C", "INPUT", "-j", "VPS-BLOCK"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if check.returncode != 0:
+            subprocess.run(["iptables", "-I", "INPUT", "1", "-j", "VPS-BLOCK"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception as e:
+        safe_print(f"[-] 初始化防火墙链失败: {e}")
+        return False
+
+
+def get_active_ssh_client_ips():
+    """获取当前机器所有活跃 SSH 会话的客户端来源 IP，防止管理员自锁"""
+    ips = set()
+    try:
+        res = subprocess.run(["who"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=3)
+        for line in res.stdout.splitlines():
+            m = re.search(r"\(([\d\.]+)\)", line)
+            if m:
+                ips.add(m.group(1))
+    except Exception:
+        pass
+    try:
+        res2 = subprocess.run(["ss", "-tn", "state", "established", "(", "sport", "=", ":22", ")"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=3)
+        for line in res2.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 4:
+                peer = parts[3]
+                if ":" in peer:
+                    peer_ip = peer.rsplit(":", 1)[0].strip("[]")
+                    if re.match(r"^(\d{1,3}\.){3}\d{1,3}$", peer_ip):
+                        ips.add(peer_ip)
+    except Exception:
+        pass
+    return ips
+
+
+def is_ip_whitelisted(ip, cfg=None):
+    """智能白名单校验：绝对防误封本机、网关、局域网、其他纳管VPS及当前SSH登录用户"""
+    if not ip or not re.match(r"^(\d{1,3}\.){3}\d{1,3}$", ip):
+        return True
+    if is_private_ip(ip) or ip in ("0.0.0.0", "255.255.255.255"):
+        return True
+    try:
+        nodes = load_nodes()
+        for n in nodes:
+            if n.get("host") == ip:
+                return True
+    except Exception:
+        pass
+    if cfg:
+        wl = (
+            cfg.get("security", {}).get("whitelist_ips", [])
+            + cfg.get("ban", {}).get("whitelist_ips", [])
+            + cfg.get("security", {}).get("known_ssh_ips", [])
+        )
+        if ip in wl:
+            return True
+    if ip in get_active_ssh_client_ips():
+        return True
+    return False
+
+
+def ban_ip(ip, reason="恶意攻击", hits=1, duration_hours=24, cfg=None):
+    """封禁指定异常 IP 并加入 iptables VPS-BLOCK 链 (在内核层直接 DROP 丢弃)"""
+    if is_ip_whitelisted(ip, cfg):
+        return False, "IP 属于系统安全白名单或当前登录会话，已自动豁免"
+    ensure_firewall_chain()
+    now_ts = int(time.time())
+    expire_ts = now_ts + int(duration_hours * 3600) if duration_hours > 0 else 0
+
+    check = subprocess.run(["iptables", "-C", "VPS-BLOCK", "-s", ip, "-j", "DROP"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if check.returncode != 0:
+        subprocess.run(["iptables", "-I", "VPS-BLOCK", "1", "-s", ip, "-j", "DROP"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    banned = load_banned_ips()
+    geo = get_ip_geo_bulk([ip]).get(ip, "未知归属地")
+    banned[ip] = {
+        "banned_at": now_ts,
+        "banned_at_str": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "expire_at": expire_ts,
+        "duration_hours": duration_hours,
+        "reason": reason,
+        "hits": hits,
+        "geo": geo
+    }
+    save_banned_ips(banned)
+    safe_print(f"[+] [防火墙阻断] 成功封禁恶意 IP: {ip} ({geo}) · 原因: {reason}")
+    return True, f"已成功封禁 {ip} ({geo})"
+
+
+def unban_ip(ip):
+    """解封指定 IP 并从 iptables 链与持久化列表中移除"""
+    ensure_firewall_chain()
+    while True:
+        res = subprocess.run(["iptables", "-D", "VPS-BLOCK", "-s", ip, "-j", "DROP"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if res.returncode != 0:
+            break
+    # 兼容解封 fail2ban (若运行)
+    try:
+        subprocess.run(["fail2ban-client", "unban", ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+    banned = load_banned_ips()
+    if ip in banned:
+        del banned[ip]
+        save_banned_ips(banned)
+        safe_print(f"[+] 已解封 IP: {ip}")
+        return True, f"已成功从防火墙黑名单解封: {ip}"
+    return True, f"防火墙规则已清理: {ip}"
+
+
+def clean_expired_bans():
+    """自动解封到期的 IP (默认24小时)"""
+    banned = load_banned_ips()
+    now_ts = int(time.time())
+    expired = []
+    for ip, info in banned.items():
+        exp = info.get("expire_at", 0)
+        if exp > 0 and now_ts >= exp:
+            expired.append(ip)
+    for ip in expired:
+        unban_ip(ip)
+        safe_print(f"[*] 封禁时效到期，已自动解封 IP: {ip}")
+    return len(expired)
+
+
+def reload_firewall_bans():
+    """开机或守护进程启动时重建 VPS-BLOCK 并恢复所有未到期的封禁规则"""
+    ensure_firewall_chain()
+    clean_expired_bans()
+    banned = load_banned_ips()
+    count = 0
+    for ip in banned.keys():
+        check = subprocess.run(["iptables", "-C", "VPS-BLOCK", "-s", ip, "-j", "DROP"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if check.returncode != 0:
+            subprocess.run(["iptables", "-I", "VPS-BLOCK", "1", "-s", ip, "-j", "DROP"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            count += 1
+    if count > 0:
+        safe_print(f"[+] 防火墙 VPS-BLOCK 已加载恢复 {count} 条封禁规则")
+
+
+# ----------------- 封禁与防御状态统计 -----------------
 def get_fail2ban_stats():
-    """获取 Fail2ban 当前生效封禁与今日新封禁"""
+    """获取当前生效封禁与今日新封禁（整合 iptables VPS-BLOCK 与 fail2ban）"""
+    clean_expired_bans()
+    banned = load_banned_ips()
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    banned_count = len(banned)
+    today_total_bans = 0
+    today_new_bans = {}
+    if banned_count > 0:
+        today_new_bans["iptables"] = 0
+
+    for ip, info in banned.items():
+        if info.get("banned_at_str", "").startswith(today_str):
+            today_total_bans += 1
+            today_new_bans["iptables"] = today_new_bans.get("iptables", 0) + 1
+
     stats = {
-        "banned_count": 0,
+        "banned_count": banned_count,
         "permanent_count": 0,
-        "temp_count": 0,
-        "today_new_bans": {},
-        "today_total_bans": 0,
-        "jails": {}
+        "temp_count": banned_count,
+        "today_new_bans": today_new_bans,
+        "today_total_bans": today_total_bans,
+        "jails": today_new_bans
     }
 
-    # 1. 查询 fail2ban-client 状态
+    # 1. 查询 fail2ban-client 状态 (若系统安装了 fail2ban 则叠加)
     try:
         res = subprocess.run(["fail2ban-client", "status"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
         if res.returncode == 0:
@@ -489,7 +670,6 @@ def get_fail2ban_stats():
     # 2. 从 /var/log/fail2ban.log 统计当天新封禁
     f2b_log = "/var/log/fail2ban.log"
     if os.path.exists(f2b_log):
-        today_str = datetime.now().strftime("%Y-%m-%d")
         ban_line_pattern = re.compile(r"^(\d{4}-\d{2}-\d{2}).*\[(\S+)\] (?:Restore )?Ban ([\d\.]+)")
         try:
             with open(f2b_log, "r", encoding="utf-8", errors="ignore") as f:
@@ -606,110 +786,133 @@ def run_check_mode(cfg, interactive=False):
     alert_thresh = cfg.get("security", {}).get("alert_threshold_failures", 5)
     site_names = cfg.get("sites", {})
     node_name = cfg.get("node_name", "本机 (主节点)")
+    ban_enabled = cfg.get("ban", {}).get("enabled", True)
+    ban_hours = cfg.get("ban", {}).get("ban_duration_hours", 24)
 
+    # 1. 检测 SSH 暴力破解与实时自动封禁
+    ssh_lines = get_ssh_lines_recent(1)
+    failed_ssh, _ = parse_ssh_lines(ssh_lines)
+    ssh_ip_counts = Counter(s["ip"] for s in failed_ssh)
+
+    auto_banned_alerts = []
+    if ban_enabled:
+        banned_now = load_banned_ips()
+        for ip, count in ssh_ip_counts.items():
+            if count >= alert_thresh and ip not in banned_now:
+                ok, msg = ban_ip(ip, reason=f"SSH 撞密爆破 {count} 次", hits=count, duration_hours=ban_hours, cfg=cfg)
+                if ok:
+                    geo = get_ip_geo_bulk([ip]).get(ip, "未知归属地")
+                    auto_banned_alerts.append({"ip": ip, "count": count, "geo": geo, "type": "SSH 爆破"})
+
+    # 2. 读取 Nginx 日志增量
     nginx_lines = read_incremental_lines(nginx_log, "nginx", state)
     save_state(state)
 
-    if not nginx_lines:
-        if interactive:
-            msg = (
-                f"✅ <b>[突发安全巡检完成] · [{html_escape(node_name)}]</b>\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"🟢 <b>运行状态</b>: 安全健康\n"
-                f"🔎 <b>检测结果</b>: 访问日志运行平稳，最近未发现任何后台登录失败或异常状态码。\n"
-                f"🕒 <b>巡检时间</b>: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
-            )
-            send_telegram(cfg, msg)
-        return
+    failed_logins = []
+    if nginx_lines:
+        failed_logins, _ = parse_nginx_lines(nginx_lines, login_paths)
+        if ban_enabled:
+            web_ip_counts = Counter(f["ip"] for f in failed_logins)
+            banned_now = load_banned_ips()
+            for ip, count in web_ip_counts.items():
+                if count >= alert_thresh and ip not in banned_now:
+                    ok, msg = ban_ip(ip, reason=f"Web 敏感后台尝试 {count} 次", hits=count, duration_hours=ban_hours, cfg=cfg)
+                    if ok:
+                        geo = get_ip_geo_bulk([ip]).get(ip, "未知归属地")
+                        auto_banned_alerts.append({"ip": ip, "count": count, "geo": geo, "type": "Web 撞库"})
 
-    failed_logins, _ = parse_nginx_lines(nginx_lines, login_paths)
-    if len(failed_logins) < alert_thresh:
-        if interactive:
-            if len(failed_logins) == 0:
-                msg = (
-                    f"✅ <b>[突发安全巡检完成] · [{html_escape(node_name)}]</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"🟢 <b>运行状态</b>: 安全健康\n"
-                    f"🔎 <b>检测结果</b>: 最近未发现任何敏感后台登录失败尝试或撞库行为。\n"
-                    f"🕒 <b>巡检时间</b>: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
-                )
+    # 若触发了新的防火墙自动封禁，发送实时阻断卡片
+    if auto_banned_alerts:
+        b_lines = [
+            f"🚫 <b>[防火墙高危攻击源自动拦截封禁] · [{html_escape(node_name)}]</b>",
+            f"━━━━━━━━━━━━━━━━━━",
+            f"🛡️ <b>防御引擎</b>: 🟢 Linux 内核防火墙 VPS-BLOCK 链 (DROP 丢弃)",
+            f"⏳ <b>封禁时长</b>: {ban_hours} 小时 (到期自动解封)",
+            f"📊 <b>本次封禁</b>: 共 <code>{len(auto_banned_alerts)}</code> 个恶意 IP",
+            f"━━━━━━━━━━━━━━━━━━",
+            f"📍 <b>被封禁恶意 IP 明细</b>:"
+        ]
+        for it in auto_banned_alerts[:10]:
+            b_lines.append(f"• <code>{it['ip']}</code> ×{it['count']} (<code>{html_escape(it['geo'])}</code>) <i>[{it['type']}]</i>")
+        if len(auto_banned_alerts) > 10:
+            b_lines.append(f"<i>... 其余 {len(auto_banned_alerts)-10} 个 IP 已同步丢弃</i>")
+        b_lines.append(f"━━━━━━━━━━━━━━━━━━")
+        b_lines.append(f"💡 <i>解封可在 Telegram 中发送: <code>/unban &lt;IP&gt;</code></i>")
+        send_telegram(cfg, "\n".join(b_lines))
+
+    # 3. 处理 Web 告警聚合通知
+    if failed_logins and len(failed_logins) >= alert_thresh:
+        groups = defaultdict(list)
+        for fl in failed_logins:
+            key = (fl["host"] or "默认站点", fl["path"])
+            groups[key].append(fl)
+
+        for (host, path), items in groups.items():
+            if len(items) < alert_thresh:
+                continue
+
+            total_fails = len(items)
+            unique_ips = Counter(it["ip"] for it in items)
+            distinct_ip_count = len(unique_ips)
+            status_counts = Counter(it["status"] for it in items)
+            status_str = "、".join(f"HTTP {code} ×{cnt}" for code, cnt in status_counts.items())
+            ua_counts = Counter(it["ua"] for it in items)
+
+            is_proxy_pool = False
+            if total_fails >= 5 and (distinct_ip_count / total_fails) >= 0.8:
+                is_proxy_pool = True
+
+            top_ips = [ip for ip, _ in unique_ips.most_common(15)]
+            geo_map = get_ip_geo_bulk(top_ips)
+
+            friendly_site = site_names.get(host, host)
+            site_display = f"{friendly_site} ({host})" if friendly_site != host else host
+            node_tag = f" · [{node_name}]" if node_name else ""
+
+            lines = []
+            lines.append(f"🔔 后台登录尝试拦截{node_tag} ({distinct_ip_count} 个 IP 汇总)")
+            lines.append(f"📊 共 {total_fails} 次失败，来自 {distinct_ip_count} 个 IP，涉及 1 个站点:")
+            lines.append(f"· {site_display} {path} -> {status_str}")
+            lines.append("")
+            lines.append(f"📍 IP 明细 (按次数排序，显示 {len(top_ips)} 个) :")
+            for ip in top_ips:
+                cnt = unique_ips[ip]
+                geo = geo_map.get(ip, "未知归属地")
+                cnt_str = f" ×{cnt}" if cnt > 1 else ""
+                lines.append(f"· {ip}{cnt_str} {geo}")
+
+            lines.append("")
+            ua_items = []
+            for ua, cnt in ua_counts.most_common(2):
+                short_ua = ua if len(ua) <= 50 else ua[:47] + "..."
+                ua_items.append(f"{short_ua} ×{cnt}")
+            lines.append(f"💻 UA: {' | '.join(ua_items)}")
+
+            start_t = items[0].get("time", "")
+            end_t = items[-1].get("time", "")
+            if start_t and end_t:
+                lines.append(f"🕒 时间: {start_t} ~ {end_t}")
             else:
-                msg = (
-                    f"ℹ️ <b>[突发安全巡检完成] · [{html_escape(node_name)}]</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"🟡 <b>运行状态</b>: 发现轻微偶发失败 (未达报警阈值)\n"
-                    f"📊 <b>失败次数</b>: 仅捕获到 {len(failed_logins)} 次失败，低于报警阈值 ({alert_thresh}次)，无需干预。\n"
-                    f"🕒 <b>巡检时间</b>: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
-                )
+                lines.append(f"🕒 时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+            if is_proxy_pool:
+                lines.append("💡 每个 IP 只试 1 次，属轮换代理池，逐个封禁意义不大。")
+
+            msg = "\n".join(lines)
             send_telegram(cfg, msg)
-        return
 
-    # 按 (host, path) 聚合统计
-    groups = defaultdict(list)
-    for fl in failed_logins:
-        key = (fl["host"] or "默认站点", fl["path"])
-        groups[key].append(fl)
-
-    for (host, path), items in groups.items():
-        if len(items) < alert_thresh:
-            continue
-
-        total_fails = len(items)
-        unique_ips = Counter(it["ip"] for it in items)
-        distinct_ip_count = len(unique_ips)
-        status_counts = Counter(it["status"] for it in items)
-        status_str = "、".join(f"HTTP {code} ×{cnt}" for code, cnt in status_counts.items())
-        ua_counts = Counter(it["ua"] for it in items)
-
-        # 智能判定：轮换代理池特征 (单 IP 单次或低次尝试)
-        is_proxy_pool = False
-        if total_fails >= 5 and (distinct_ip_count / total_fails) >= 0.8:
-            is_proxy_pool = True
-
-        # 查询 IP 归属地与 ISP (按尝试次数倒序取前 15 个)
-        top_ips = [ip for ip, _ in unique_ips.most_common(15)]
-        geo_map = get_ip_geo_bulk(top_ips)
-
-        # 站点友好名称转换
-        friendly_site = site_names.get(host, host)
-        site_display = f"{friendly_site} ({host})" if friendly_site != host else host
-
-        # 组装 1:1 格式告警消息 (支持多 VPS 节点标识)
-        node_name = cfg.get("node_name", "")
-        node_tag = f" · [{node_name}]" if node_name else ""
-
-        lines = []
-        lines.append(f"🔔 后台登录尝试拦截{node_tag} ({distinct_ip_count} 个 IP 汇总)")
-        lines.append(f"📊 共 {total_fails} 次失败，来自 {distinct_ip_count} 个 IP，涉及 1 个站点:")
-        lines.append(f"· {site_display} {path} -> {status_str}")
-        lines.append("")
-        lines.append(f"📍 IP 明细 (按次数排序，显示 {len(top_ips)} 个) :")
-        for ip in top_ips:
-            cnt = unique_ips[ip]
-            geo = geo_map.get(ip, "未知归属地")
-            cnt_str = f" ×{cnt}" if cnt > 1 else ""
-            lines.append(f"· {ip}{cnt_str} {geo}")
-
-        lines.append("")
-        # 提取核心 UA 信息
-        ua_items = []
-        for ua, cnt in ua_counts.most_common(2):
-            short_ua = ua if len(ua) <= 50 else ua[:47] + "..."
-            ua_items.append(f"{short_ua} ×{cnt}")
-        lines.append(f"💻 UA: {' | '.join(ua_items)}")
-
-        # 时间范围
-        start_t = items[0].get("time", "")
-        end_t = items[-1].get("time", "")
-        if start_t and end_t:
-            lines.append(f"🕒 时间: {start_t} ~ {end_t}")
-        else:
-            lines.append(f"🕒 时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
-        if is_proxy_pool:
-            lines.append("💡 每个 IP 只试 1 次，属轮换代理池，逐个封禁意义不大。")
-
-        msg = "\n".join(lines)
+    if interactive:
+        banned_stats = get_fail2ban_stats()
+        b_cnt = banned_stats.get("banned_count", 0)
+        recent_ssh_fails = sum(ssh_ip_counts.values())
+        msg = (
+            f"✅ <b>[突发安全巡检完成] · [{html_escape(node_name)}]</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🟢 <b>运行状态</b>: 安全健康\n"
+            f"🛡️ <b>防火墙状态</b>: 生效封禁中 <code>{b_cnt}</code> 个高危攻击 IP\n"
+            f"🔎 <b>实时审计</b>: 最近 1 小时内捕获到 <code>{recent_ssh_fails}</code> 次 SSH 探测\n"
+            f"🕒 <b>巡检时间</b>: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+        )
         send_telegram(cfg, msg)
 
 
@@ -1069,25 +1272,33 @@ def run_daily_mode(cfg, send_tg=True, force=False):
         if host and ip not in ip_to_host:
             ip_to_host[ip] = host
 
-    # 4. Fail2ban 统计
-    f2b = get_fail2ban_stats()
-    new_bans_summary = []
-    for jail, cnt in f2b["today_new_bans"].items():
-        new_bans_summary.append(f"{jail} {cnt}")
-    new_bans_str = "、".join(new_bans_summary) if new_bans_summary else "无"
-
-    # 5. IP 归属地查询
-    top_probe_ips = [ip for ip, _ in scan_ips.most_common(3)]
     # 合并 Web 登录失败与 SSH 撞密
     total_login_fail_ips = Counter()
     total_login_fail_ips.update(login_fail_ips)
     total_login_fail_ips.update(ssh_fail_ips)
     top_login_ips = [ip for ip, _ in total_login_fail_ips.most_common(5)]
 
+    # 4. 异常高频撞密与暴力破解 IP 自动加入防火墙封禁 (DROP)
+    if cfg.get("ban", {}).get("enabled", True):
+        ban_thresh = cfg.get("ban", {}).get("max_ssh_failures", 5)
+        ban_hrs = cfg.get("ban", {}).get("ban_duration_hours", 24)
+        for ip, cnt in total_login_fail_ips.items():
+            if cnt >= ban_thresh:
+                ban_ip(ip, reason=f"SSH/Web 爆破尝试 {cnt} 次", hits=cnt, duration_hours=ban_hrs, cfg=cfg)
+
+    # 5. 防火墙与 Fail2ban 统计
+    f2b = get_fail2ban_stats()
+    new_bans_summary = []
+    for jail, cnt in f2b["today_new_bans"].items():
+        new_bans_summary.append(f"{jail} {cnt}")
+    new_bans_str = "、".join(new_bans_summary) if new_bans_summary else "无"
+
+    # 6. IP 归属地查询
+    top_probe_ips = [ip for ip, _ in scan_ips.most_common(3)]
     all_needed_ips = list(set(top_probe_ips + top_login_ips))
     geo_map = get_ip_geo_bulk(all_needed_ips)
 
-    # 6. 陌生 IP 登录检查
+    # 7. 陌生 IP 登录检查
     known_ips = set(cfg.get("security", {}).get("known_ssh_ips", ["127.0.0.1"]))
     stranger_logins = [a for a in accepted_ssh if a["ip"] not in known_ips]
 
@@ -1299,8 +1510,9 @@ def send_boot_notification(cfg):
 
 
 def run_daemon_mode(cfg):
-    """常驻后台保活守护进程：开机通知 + 每 60s 增量检测突发攻击 + 每天 09:00 安全日报"""
+    """常驻后台保活守护进程：开机通知 + 重建防火墙规则 + 每 60s 增量检测突发攻击 + 每天 09:00 安全日报"""
     safe_print("[*] VPS 安全巡检常驻保活守护进程已启动...")
+    reload_firewall_bans()
     _, uptime_secs = get_uptime_info()
     if uptime_secs < 300:
         send_boot_notification(cfg)
@@ -1309,7 +1521,8 @@ def run_daemon_mode(cfg):
     while True:
         try:
             cfg = load_config()
-            # 1. 增量突发检测
+            clean_expired_bans()
+            # 1. 增量突发检测与高频攻击实时封禁
             run_check_mode(cfg, interactive=False)
 
             # 2. 每日 09:00 日报检测 (采用东八区北京时间 UTC+8，确保准点推送)
@@ -1371,6 +1584,43 @@ def main():
             print("[+] 测试消息已成功推送到 Telegram！")
         else:
             print("[-] 测试失败，请检查配置文件中的 bot_token 与 chat_id。")
+    elif cmd == "ban":
+        if len(sys.argv) < 3:
+            print("用法: python3 vps_security_guard.py ban <IP> [时长(小时)] [原因]")
+            sys.exit(1)
+        target_ip = sys.argv[2].strip()
+        hours = float(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].replace(".", "", 1).isdigit() else 24
+        reason = sys.argv[4].strip() if len(sys.argv) > 4 else "管理员手动封禁"
+        ok, msg = ban_ip(target_ip, reason=reason, duration_hours=hours, cfg=cfg)
+        print(f"[{'+' if ok else '-'}] {msg}")
+    elif cmd == "unban":
+        if len(sys.argv) < 3:
+            print("用法: python3 vps_security_guard.py unban <IP>")
+            sys.exit(1)
+        target_ip = sys.argv[2].strip()
+        ok, msg = unban_ip(target_ip)
+        print(f"[{'+' if ok else '-'}] {msg}")
+    elif cmd == "banned":
+        clean_expired_bans()
+        banned = load_banned_ips()
+        print(f"当前 VPS-BLOCK 防火墙链生效封禁: 共 {len(banned)} 个 IP")
+        for ip, info in banned.items():
+            exp_sec = info.get("expire_at", 0) - time.time()
+            exp_str = f"剩 {exp_sec / 3600:.1f} 小时" if exp_sec > 0 else "永久"
+            print(f"  • {ip} ({info.get('geo', '未知')}) | {info.get('reason', '')} | {exp_str}")
+    elif cmd == "autoban":
+        ban_threshold = cfg.get("ban", {}).get("max_ssh_failures", 5)
+        ban_hours = cfg.get("ban", {}).get("ban_duration_hours", 24)
+        ssh_lines = get_ssh_lines_recent(24)
+        failed_ssh, _ = parse_ssh_lines(ssh_lines)
+        counts = Counter(it["ip"] for it in failed_ssh)
+        banned_new = 0
+        for ip, cnt in counts.items():
+            if cnt >= ban_threshold:
+                ok, _ = ban_ip(ip, reason=f"SSH 暴力破解 {cnt} 次", hits=cnt, duration_hours=ban_hours, cfg=cfg)
+                if ok:
+                    banned_new += 1
+        print(f"[+] 自动扫描封禁完成，新增封禁: {banned_new} 个恶意 IP，当前生效总封禁: {len(load_banned_ips())} 个")
     else:
         print(f"[ERROR] 未知命令: {cmd}")
 
