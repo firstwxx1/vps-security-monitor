@@ -146,7 +146,7 @@ detect_nginx_log() {
 DETECTED_LOG="$(detect_nginx_log)"
 
 # 写入命令行传入的配置参数或更新默认日志路径
-python3 - "$CLI_TOKEN" "$CLI_CHAT" "$CLI_NAME" "$DETECTED_LOG" "${INSTALL_DIR}/config.json" "$IS_AGENT" << 'EOF'
+python3 - "$CLI_TOKEN" "$CLI_CHAT" "$CLI_NAME" "$DETECTED_LOG" "${INSTALL_DIR}/config.json" "$IS_AGENT" "$CLI_MASTER" << 'EOF'
 import sys, json, os
 
 token, chat, name, detected_log, cfg_path = (
@@ -154,6 +154,7 @@ token, chat, name, detected_log, cfg_path = (
     sys.argv[4].strip(), sys.argv[5].strip()
 )
 is_agent = sys.argv[6].strip().lower() if len(sys.argv) > 6 else "false"
+cli_master = sys.argv[7].strip() if len(sys.argv) > 7 else ""
 
 cfg = {}
 if os.path.exists(cfg_path):
@@ -171,6 +172,8 @@ if name:
     cfg["node_name"] = name
 if is_agent == "true":
     cfg["role"] = "agent"
+if cli_master:
+    cfg["master"] = cli_master
 
 # 如果默认配置的日志路径不存在但探测到了存在的路径，自动修正
 current_log = cfg.get("logs", {}).get("nginx_access_log", "")

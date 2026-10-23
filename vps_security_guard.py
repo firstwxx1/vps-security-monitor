@@ -713,6 +713,97 @@ def run_check_mode(cfg, interactive=False):
 
 
 # ----------------- 模式 B: 安全日报 (daily) 与全节点汇总 -----------------
+def fetch_node_metrics_ssh(target, timeout=4):
+    """通过 SSH 从远程被控节点实时拉取完整的每日安全巡检指标数据"""
+    host = target.get("host")
+    port = target.get("port", 22)
+    user = target.get("user", "root")
+    pwd = target.get("password")
+    if not host or not pwd:
+        return target.get("metrics")
+    try:
+        import paramiko
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(host, port=port, username=user, password=pwd, timeout=timeout)
+        cmd = (
+            "python3 -c \""
+            "import sys, json; sys.path.append('/opt/vps-security-monitor'); "
+            "import vps_security_guard as guard; "
+            "cfg = guard.load_config(); "
+            "res = guard.run_daily_mode(cfg, send_tg=False); "
+            "print('---METRICS_JSON---'); "
+            "print(json.dumps(res, ensure_ascii=False))\""
+        )
+        _, stdout, _ = ssh.exec_command(cmd, timeout=timeout + 3)
+        out = stdout.read().decode("utf-8", errors="ignore")
+        ssh.close()
+        if "---METRICS_JSON---" in out:
+            json_str = out.split("---METRICS_JSON---")[-1].strip()
+            metrics = json.loads(json_str)
+            target["metrics"] = metrics
+            return metrics
+    except Exception as e:
+        safe_print(f"[-] 从远程节点 {host} 拉取指标失败: {e}")
+    return target.get("metrics")
+
+
+def sync_metrics_to_master(cfg, metrics=None):
+    """被控子节点向中央主控 HTTP API (/api/report) 上报最新指标"""
+    master = cfg.get("master", "").strip()
+    token = cfg.get("telegram", {}).get("bot_token", "").strip()
+    if not master and token:
+        try:
+            desc_url = f"https://api.telegram.org/bot{token}/getMyShortDescription"
+            with urllib.request.urlopen(desc_url, timeout=4) as r:
+                res = json.loads(r.read().decode("utf-8"))
+                s_desc = res.get("result", {}).get("short_description", "")
+                if s_desc.startswith("master:"):
+                    parts = s_desc.split(":")
+                    master = f"{parts[1]}:{parts[2] if len(parts) > 2 else '9527'}"
+        except Exception:
+            pass
+
+    if not master:
+        return False
+
+    secret = ""
+    if token:
+        secret = hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+
+    if metrics is None:
+        metrics = run_daily_mode(cfg, send_tg=False)
+
+    pub_ip = get_public_ip()
+    os_name = "Linux"
+    try:
+        with open("/etc/os-release", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("PRETTY_NAME="):
+                    os_name = line.split("=", 1)[1].strip().strip('"')
+                    break
+    except Exception:
+        pass
+
+    payload = {
+        "secret": secret,
+        "ip": pub_ip,
+        "name": cfg.get("node_name", f"vps-{pub_ip}"),
+        "os": os_name,
+        "metrics": metrics
+    }
+    try:
+        url = f"http://{master}/api/report"
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+            return res.get("ok", False)
+    except Exception as e:
+        safe_print(f"[-] 上报指标到主控失败: {e}")
+        return False
+
+
 def build_all_nodes_daily_report(cfg, local_data=None):
     """将所有纳管的 VPS 节点（包括主机与后续添加的任意新节点）汇总为统一的全节点安全日报"""
     nodes = load_nodes()
@@ -804,6 +895,14 @@ def build_all_nodes_daily_report(cfg, local_data=None):
                     f"└ ❌ 获取本地数据异常: <code>{html_escape(str(e)[:30])}</code>"
                 )
         else:
+            # 远程子节点（支持 SSH 实时拉取、HTTP 上报指标缓存与免密探活）
+            target_pwd = target.get("password")
+            metrics = None
+            if target_pwd:
+                metrics = fetch_node_metrics_ssh(target, timeout=4)
+            if not metrics:
+                metrics = target.get("metrics")
+
             t0 = time.time()
             latency = None
             try:
@@ -815,14 +914,65 @@ def build_all_nodes_daily_report(cfg, local_data=None):
             except Exception:
                 lat_tag = "🔴 无法连接 (离线或端口未通)"
 
-            sec_lines = [
-                f"🏷️ <b>[{idx+1}] {html_escape(name)}</b> · <code>{host}:{port}</code> <i>(受控子节点)</i>",
-                f"├ 📡 <b>实时网络</b>: {lat_tag}",
-                f"├ 💻 <b>操作系统</b>: <code>{html_escape(os_name)}</code>",
-                f"├ 🛡️ <b>防护引擎</b>: 🟢 Systemd 守护进程常驻保活 (秒级检测)",
-                f"└ ⏰ <b>告警审计</b>: 本地全天候自主阻断与开机重启自启通知"
-            ]
-            node_sections.append("\n".join(sec_lines))
+            if metrics:
+                ssh_cnt = metrics.get("ssh_fail_count", 0)
+                scan_cnt = metrics.get("scan_count", 0)
+                web_cnt = metrics.get("login_fail_count", 0)
+                node_attacks = ssh_cnt + scan_cnt + web_cnt
+                total_attacks += node_attacks
+                banned_cnt = metrics.get("banned_count", 0)
+                total_bans += banned_cnt
+
+                cert_info = ""
+                if metrics.get("nearest_cert"):
+                    dom, days = metrics["nearest_cert"]
+                    cert_info = f" · 证书剩 {days}天"
+
+                backup_info = ""
+                if metrics.get("backup_status"):
+                    backup_info = f" · {metrics['backup_status']}"
+
+                sec_lines = [
+                    f"🏷️ <b>[{idx+1}] {html_escape(name)}</b> · <code>{host}</code> <i>(受控子节点)</i>",
+                    f"├ 🖥️ <b>SSH防爆破</b>: 拦截 <code>{ssh_cnt:,}</code> 次 | 封禁中: <code>{banned_cnt}</code> 个",
+                    f"├ 🌐 <b>Web扫描探测</b>: <code>{scan_cnt}</code> 次 | 登录失败: <code>{web_cnt}</code> 次",
+                    f"├ ⚠️ <b>疑似陌生登录</b>: <code>{metrics.get('stranger_logins', 0)}</code> 次",
+                ]
+
+                top_logins = metrics.get("top_login_details", [])
+                if top_logins:
+                    sec_lines.append("├ 🚨 <b>撞密码最多的来源 IP</b>:")
+                    for item in top_logins[:3]:
+                        ip_str = item.get("ip")
+                        cnt = item.get("count", 0)
+                        geo = item.get("geo", "未知")
+                        sec_lines.append(f"│  • <code>{ip_str}</code> ×{cnt} (<code>{html_escape(geo)}</code>)")
+
+                top_probes = metrics.get("top_probe_details", [])
+                if top_probes:
+                    sec_lines.append("├ 🔍 <b>扫描探测最多的来源 IP</b>:")
+                    for item in top_probes[:2]:
+                        ip_str = item.get("ip")
+                        cnt = item.get("count", 0)
+                        geo = item.get("geo", "未知")
+                        sec_lines.append(f"│  • <code>{ip_str}</code> ×{cnt} (<code>{html_escape(geo)}</code>)")
+
+                disk_pct = metrics.get("disk_percent", "未知")
+                disk_free = metrics.get("disk_free_gb", "未知")
+                mem_avail = metrics.get("mem_avail_mb", "未知")
+                sec_lines.append(
+                    f"└ 💾 <b>系统负载</b>: 磁盘 <code>{disk_pct}%</code> (剩 {disk_free}G) · 内存可用 <code>{mem_avail}MB</code>{cert_info}{backup_info}"
+                )
+                node_sections.append("\n".join(sec_lines))
+            else:
+                sec_lines = [
+                    f"🏷️ <b>[{idx+1}] {html_escape(name)}</b> · <code>{host}:{port}</code> <i>(受控子节点)</i>",
+                    f"├ 📡 <b>实时网络</b>: {lat_tag}",
+                    f"├ 💻 <b>操作系统</b>: <code>{html_escape(os_name)}</code>",
+                    f"├ 🛡️ <b>防护引擎</b>: 🟢 Systemd 守护进程常驻保活 (秒级检测)",
+                    f"└ 💡 <b>攻防指标</b>: ⚠️ 尚未配置 SSH 密码。在 /nodes 中点击【🔑 配置 SSH 密码】即可同步该机器的攻防与负载指标！"
+                ]
+                node_sections.append("\n".join(sec_lines))
 
     nodes_body = "\n\n".join(node_sections)
     final_report = (
@@ -1032,6 +1182,14 @@ def run_daily_mode(cfg, send_tg=True, force=False):
 
     if not send_tg:
         return local_result
+
+    # 如果当前角色为受控子节点 (agent)，自动上报指标至中央主控机，由主控统一汇聚推送
+    if cfg.get("role") == "agent" or cfg.get("master"):
+        synced = sync_metrics_to_master(cfg, local_result)
+        if cfg.get("role") == "agent":
+            if synced:
+                safe_print("[+] 已成功将本地指标同步上报至主控中心！")
+            return local_result
 
     # send_tg=True 模式：检测是否配置了纳管节点（主控模式）
     nodes = load_nodes()

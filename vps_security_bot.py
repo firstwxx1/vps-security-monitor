@@ -102,7 +102,7 @@ def html_escape(text):
 
 
 class NodeRegistrationHandler(http.server.BaseHTTPRequestHandler):
-    """处理从被控 VPS (install.sh) 发起的全自动节点上线入库注册请求"""
+    """处理从被控 VPS 发起的主动入库注册 (/api/register) 与指标周期性上报同步 (/api/report)"""
     bot_ref = None
 
     def do_GET(self):
@@ -113,30 +113,35 @@ class NodeRegistrationHandler(http.server.BaseHTTPRequestHandler):
 
     def process_request(self):
         parsed = urllib.parse.urlparse(self.path)
-        if parsed.path != "/api/register":
+        if parsed.path not in ("/api/register", "/api/report"):
             self.send_response(404)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(b'{"ok": false, "error": "Not Found"}')
             return
 
-        qs = urllib.parse.parse_qs(parsed.query)
-        if not qs and self.command == "POST":
+        body_dict = {}
+        if self.command == "POST":
             length = int(self.headers.get("Content-Length", 0))
             if length > 0:
                 body = self.rfile.read(length).decode("utf-8", errors="ignore")
                 try:
-                    data = json.loads(body)
-                    qs = {k: [str(v)] for k, v in data.items()}
+                    body_dict = json.loads(body)
                 except Exception:
                     qs = urllib.parse.parse_qs(body)
+                    body_dict = {k: v[0] for k, v in qs.items()}
 
-        secret = qs.get("secret", [""])[0].strip()
-        ip = qs.get("ip", [""])[0].strip()
-        name = qs.get("name", [""])[0].strip()
-        os_info = qs.get("os", ["Linux"])[0].strip()
+        qs = urllib.parse.parse_qs(parsed.query)
+        for k, v in qs.items():
+            if k not in body_dict and v:
+                body_dict[k] = v[0]
 
-        # 客户端未传公网 IP 时，直接提取客户端 Socket 来源 IP
+        secret = body_dict.get("secret", "").strip()
+        ip = body_dict.get("ip", "").strip()
+        name = body_dict.get("name", "").strip()
+        os_info = body_dict.get("os", "Linux").strip()
+
+        # 客户端未传公网 IP 时，提取客户端 Socket 来源 IP
         if not ip or ip in ("127.0.0.1", "localhost"):
             ip = self.client_address[0]
 
@@ -147,9 +152,42 @@ class NodeRegistrationHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(403)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(b'{"ok": false, "error": "Forbidden: Invalid registration secret"}')
+            self.wfile.write(b'{"ok": false, "error": "Forbidden: Invalid secret"}')
             return
 
+        # 模式 1: 指标同步上报接口 (/api/report)
+        if parsed.path == "/api/report":
+            metrics = body_dict.get("metrics", {})
+            nodes = load_nodes()
+            matched = False
+            for n in nodes:
+                if n.get("host") == ip:
+                    n["metrics"] = metrics
+                    n["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    matched = True
+                    break
+            if not matched:
+                display_name = name.strip() if name else f"vps-{ip}"
+                nodes.append({
+                    "name": display_name,
+                    "host": ip,
+                    "port": 22,
+                    "user": "root",
+                    "os": os_info,
+                    "is_local": False,
+                    "metrics": metrics,
+                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                })
+            save_nodes(nodes)
+            print(f"[+] 成功接收并更新节点安全指标: {ip}", flush=True)
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"ok": true, "message": "Metrics synced"}')
+            return
+
+        # 模式 2: 新节点自动入库注册接口 (/api/register)
         display_name = name.strip() if name else f"vps-{ip}"
         nodes = load_nodes()
         nodes = [n for n in nodes if n.get("host") != ip]
@@ -293,6 +331,40 @@ class SecurityBot:
             return "vps-sec-default"
         return hashlib.sha256(self.token.encode("utf-8")).hexdigest()[:16]
 
+    def fetch_node_metrics_ssh(self, target, timeout=4):
+        """通过 SSH 从远程被控节点实时拉取完整的每日安全巡检指标数据"""
+        host = target.get("host")
+        port = target.get("port", 22)
+        user = target.get("user", "root")
+        pwd = target.get("password")
+        if not host or not pwd:
+            return target.get("metrics")
+        try:
+            import paramiko
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(host, port=port, username=user, password=pwd, timeout=timeout)
+            cmd = (
+                "python3 -c \""
+                "import sys, json; sys.path.append('/opt/vps-security-monitor'); "
+                "import vps_security_guard as guard; "
+                "cfg = guard.load_config(); "
+                "res = guard.run_daily_mode(cfg, send_tg=False); "
+                "print('---METRICS_JSON---'); "
+                "print(json.dumps(res, ensure_ascii=False))\""
+            )
+            _, stdout, _ = ssh.exec_command(cmd, timeout=timeout + 3)
+            out = stdout.read().decode("utf-8", errors="ignore")
+            ssh.close()
+            if "---METRICS_JSON---" in out:
+                json_str = out.split("---METRICS_JSON---")[-1].strip()
+                metrics = json.loads(json_str)
+                target["metrics"] = metrics
+                return metrics
+        except Exception as e:
+            print(f"[-] 从远程节点 {host} 拉取指标失败: {e}", flush=True)
+        return target.get("metrics")
+
     def start_registration_server(self, port=9527):
         """启动后台守护的 HTTP 节点自动注册 API 监听"""
         if self.reg_server:
@@ -338,6 +410,7 @@ class SecurityBot:
             {"command": "add", "description": "在TG中添加VPS节点"},
             {"command": "check", "description": "立即全节点突发巡检"},
             {"command": "daily", "description": "获取全节点安全日报"},
+            {"command": "pwd", "description": "配置受控节点SSH密码"},
             {"command": "cmd", "description": "专属一键安装命令"},
         ]
         res = self.api_call("setMyCommands", {"commands": commands})
@@ -538,6 +611,18 @@ class SecurityBot:
             pass
         lat_str = f"🟢 正常在线 (延迟 <code>{latency:.1f} ms</code>)" if latency is not None else "🔴 无法连接 (离线或超时)"
 
+        has_pwd = bool(target.get("password"))
+        pwd_desc = "🟢 已配置 (实时指标拉取就绪)" if has_pwd else "⚠️ 未配置 (点击下方按钮一键配置)"
+        metrics = target.get("metrics")
+        metric_desc = "🟢 已同步最新指标" if metrics else "⚪ 待同步 (配置 SSH 密码后即时拉取)"
+
+        sub_info = ""
+        if not is_local:
+            sub_info = (
+                f"🔑 <b>SSH 凭据</b>: {pwd_desc}\n"
+                f"📊 <b>攻防指标</b>: {metric_desc}\n"
+            )
+
         text = (
             f"🖥️ <b>VPS 节点详情 · 【{html_escape(name)}】</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
@@ -546,6 +631,7 @@ class SecurityBot:
             f"📌 <b>节点角色</b>: <code>{role_str}</code>\n"
             f"💻 <b>操作系统</b>: <code>{html_escape(os_name)}</code>\n"
             f"📡 <b>实时网络</b>: {lat_str}\n"
+            f"{sub_info}"
             f"🛡️ <b>防护引擎</b>: 🟢 Systemd 守护进程常驻保活 (秒级检测)\n"
             f"📦 <b>纳管时间</b>: <code>{created}</code>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
@@ -556,13 +642,20 @@ class SecurityBot:
             [
                 {"text": "🔍 即时突发巡检", "callback_data": f"act:chk_node:{idx}"},
                 {"text": "📊 专属安全日报", "callback_data": f"act:day_node:{idx}"}
-            ],
-            [
-                {"text": "✏️ 修改节点别名", "callback_data": f"act:ren_node:{idx}"}
             ]
         ]
         if not is_local:
-            detail_buttons[1].append({"text": "🗑️ 移除此节点", "callback_data": f"act:del_node:{idx}"})
+            detail_buttons.append([
+                {"text": "✏️ 修改节点别名", "callback_data": f"act:ren_node:{idx}"},
+                {"text": "🔑 配置/更新 SSH 密码", "callback_data": f"act:pwd_node:{idx}"}
+            ])
+            detail_buttons.append([
+                {"text": "🗑️ 移除此节点", "callback_data": f"act:del_node:{idx}"}
+            ])
+        else:
+            detail_buttons.append([
+                {"text": "✏️ 修改节点别名", "callback_data": f"act:ren_node:{idx}"}
+            ])
 
         detail_buttons.append([
             {"text": "🔙 返回节点列表", "callback_data": "nav:nodes"},
@@ -574,6 +667,132 @@ class SecurityBot:
             self.edit_msg(chat_id, msg_id, text, reply_markup=kb)
         else:
             self.send_msg(chat_id, text, reply_markup=kb)
+
+    def prompt_node_password(self, chat_id, idx, msg_id=None):
+        nodes = load_nodes()
+        if not (0 <= idx < len(nodes)):
+            self.send_msg(chat_id, "❌ 节点序号无效！")
+            return
+        target = nodes[idx]
+        name = target.get("name", "未命名")
+        host = target.get("host", "")
+        port = target.get("port", 22)
+        user = target.get("user", "root")
+
+        self.user_states[chat_id] = {
+            "state": "waiting_node_pwd",
+            "node_idx": idx,
+            "orig_msg_id": msg_id
+        }
+        text = (
+            f"🔑 <b>为【{html_escape(name)}】配置/更新 SSH 密码</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🌐 <b>目标地址</b>: <code>{user}@{host}:{port}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"请直接在当前聊天窗口<b>回复 root 用户的 SSH 密码</b>：\n\n"
+            f"💡 <i>作用说明：配置后机器人将通过安全的 SSH 自动拉取该节点的实时防御统计（SSH爆破、Web扫描、攻击源IP、系统负载）并在 /daily 总报中展示。\n"
+            f"🔒 安全说明：密码仅保存在本地 nodes.json，不上传任何第三方。\n\n"
+            f"如需取消，请点击下方按钮返回。</i>"
+        )
+        kb = {
+            "inline_keyboard": [
+                [{"text": "🔙 取消返回", "callback_data": f"act:node_detail:{idx}"}]
+            ]
+        }
+        if msg_id:
+            self.edit_msg(chat_id, msg_id, text, reply_markup=kb)
+        else:
+            self.send_msg(chat_id, text, reply_markup=kb)
+
+    def verify_and_save_node_password(self, chat_id, idx, pwd):
+        nodes = load_nodes()
+        if not (0 <= idx < len(nodes)):
+            self.send_msg(chat_id, "❌ 节点序号无效！")
+            return
+        target = nodes[idx]
+        name = target.get("name", "未命名")
+        host = target.get("host", "")
+        port = target.get("port", 22)
+        user = target.get("user", "root")
+
+        prog_res = self.send_msg(
+            chat_id,
+            f"⏳ 正在测试与 <b>【{html_escape(name)}】</b> (<code>{host}:{port}</code>) 的 SSH 连接，请稍候..."
+        )
+        prog_msg_id = prog_res.get("result", {}).get("message_id") if prog_res else None
+
+        def worker():
+            try:
+                import paramiko
+                ssh = paramiko.SSHClient()
+                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                ssh.connect(host, port=port, username=user, password=pwd, timeout=8)
+                ssh.close()
+
+                # 连接验证通过，存入 nodes.json
+                target["password"] = pwd
+                save_nodes(nodes)
+
+                # 立即实时拉取该节点的完整指标
+                metrics = self.fetch_node_metrics_ssh(target, timeout=8)
+                save_nodes(nodes)
+
+                metric_hint = "已即时拉取该机器的攻防拦截与系统负载指标！" if metrics else "SSH 验证通过，等待下一次巡检同步指标。"
+
+                succ_text = (
+                    f"🎉 <b>[【{html_escape(name)}】SSH 密码配置成功！]</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"🌐 <b>目标地址</b>: <code>{user}@{host}:{port}</code>\n"
+                    f"📡 <b>连接状态</b>: 🟢 SSH 验证通过，通信通道畅通\n"
+                    f"📊 <b>指标同步</b>: ✅ {metric_hint}\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"💡 <i>现在你可以发送 /daily 或点击下方按钮查看包含【{html_escape(name)}】完整攻防总报！</i>"
+                )
+                kb = {
+                    "inline_keyboard": [
+                        [
+                            {"text": "📊 查看全节点安全总报", "callback_data": "act:daily_all"},
+                            {"text": "🔍 立即突发体检", "callback_data": f"act:chk_node:{idx}"}
+                        ],
+                        [
+                            {"text": "🖥️ 返回节点详情", "callback_data": f"act:node_detail:{idx}"},
+                            {"text": "📋 节点列表", "callback_data": "nav:nodes"}
+                        ]
+                    ]
+                }
+                if prog_msg_id:
+                    self.edit_msg(chat_id, prog_msg_id, succ_text, reply_markup=kb)
+                else:
+                    self.send_msg(chat_id, succ_text, reply_markup=kb)
+            except Exception as e:
+                err_msg = str(e)
+                if "Authentication failed" in err_msg:
+                    err_msg = "SSH 用户名或密码错误，请核实后重试"
+                elif "timed out" in err_msg:
+                    err_msg = "SSH 连接超时，请检查 IP 端口及安全组防火墙规则"
+
+                fail_text = (
+                    f"❌ <b>SSH 连接验证失败 · 【{html_escape(name)}】</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"🌐 目标地址: <code>{user}@{host}:{port}</code>\n"
+                    f"🚨 错误原因: <code>{html_escape(err_msg)}</code>\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"💡 <i>密码未被保存。请点击下方按钮重新配置或返回：</i>"
+                )
+                kb = {
+                    "inline_keyboard": [
+                        [
+                            {"text": "🔄 重新输入密码", "callback_data": f"act:pwd_node:{idx}"},
+                            {"text": "🔙 返回节点详情", "callback_data": f"act:node_detail:{idx}"}
+                        ]
+                    ]
+                }
+                if prog_msg_id:
+                    self.edit_msg(chat_id, prog_msg_id, fail_text, reply_markup=kb)
+                else:
+                    self.send_msg(chat_id, fail_text, reply_markup=kb)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def prompt_rename_node(self, chat_id, idx, msg_id=None):
         nodes = load_nodes()
@@ -1084,13 +1303,76 @@ class SecurityBot:
                     target_port = target.get("port", 22)
                     target_pwd = target.get("password")
 
+                    metrics = None
                     if target_pwd:
-                        import paramiko
-                        ssh = paramiko.SSHClient()
-                        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                        ssh.connect(target_host, port=target_port, username=target.get("user", "root"), password=target_pwd, timeout=8)
-                        ssh.exec_command("python3 /opt/vps-security-monitor/vps_security_guard.py daily", timeout=15)
-                        ssh.close()
+                        metrics = self.fetch_node_metrics_ssh(target, timeout=6)
+                    if not metrics:
+                        metrics = target.get("metrics")
+
+                    if metrics:
+                        ssh_cnt = metrics.get("ssh_fail_count", 0)
+                        scan_cnt = metrics.get("scan_count", 0)
+                        web_cnt = metrics.get("login_fail_count", 0)
+                        banned_cnt = metrics.get("banned_count", 0)
+
+                        cert_info = ""
+                        if metrics.get("nearest_cert"):
+                            dom, days = metrics["nearest_cert"]
+                            cert_info = f" · 证书剩 {days}天"
+
+                        backup_info = ""
+                        if metrics.get("backup_status"):
+                            backup_info = f" · {metrics['backup_status']}"
+
+                        sec_lines = [
+                            f"🛡️ <b>[专属安全日报 · {html_escape(name)}]</b>",
+                            f"━━━━━━━━━━━━━━━━━━",
+                            f"🌐 <b>网络地址</b>: <code>{target_host}:{target_port}</code> <i>(受控子节点)</i>",
+                            f"├ 🖥️ <b>SSH防爆破</b>: 拦截 <code>{ssh_cnt:,}</code> 次 | 封禁中: <code>{banned_cnt}</code> 个",
+                            f"├ 🌐 <b>Web扫描探测</b>: <code>{scan_cnt}</code> 次 | 登录失败: <code>{web_cnt}</code> 次",
+                            f"├ ⚠️ <b>疑似陌生登录</b>: <code>{metrics.get('stranger_logins', 0)}</code> 次",
+                        ]
+
+                        top_logins = metrics.get("top_login_details", [])
+                        if top_logins:
+                            sec_lines.append("├ 🚨 <b>撞密码最多的来源 IP</b>:")
+                            for item in top_logins[:3]:
+                                ip_str = item.get("ip")
+                                cnt = item.get("count", 0)
+                                geo = item.get("geo", "未知")
+                                sec_lines.append(f"│  • <code>{ip_str}</code> ×{cnt} (<code>{html_escape(geo)}</code>)")
+
+                        top_probes = metrics.get("top_probe_details", [])
+                        if top_probes:
+                            sec_lines.append("├ 🔍 <b>扫描探测最多的来源 IP</b>:")
+                            for item in top_probes[:2]:
+                                ip_str = item.get("ip")
+                                cnt = item.get("count", 0)
+                                geo = item.get("geo", "未知")
+                                sec_lines.append(f"│  • <code>{ip_str}</code> ×{cnt} (<code>{html_escape(geo)}</code>)")
+
+                        disk_pct = metrics.get("disk_percent", "未知")
+                        disk_free = metrics.get("disk_free_gb", "未知")
+                        mem_avail = metrics.get("mem_avail_mb", "未知")
+                        sec_lines.append(
+                            f"└ 💾 <b>系统负载</b>: 磁盘 <code>{disk_pct}%</code> (剩 {disk_free}G) · 内存可用 <code>{mem_avail}MB</code>{cert_info}{backup_info}"
+                        )
+                        sec_lines.append("━━━━━━━━━━━━━━━━━━")
+                        sec_lines.append(f"🕒 <b>生成时间</b>: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>")
+
+                        kb = {
+                            "inline_keyboard": [
+                                [
+                                    {"text": "📊 全节点安全总报", "callback_data": "act:daily_all"},
+                                    {"text": "🔍 突发安全体检", "callback_data": f"act:chk_node:{node_idx if node_idx is not None else 0}"}
+                                ],
+                                [
+                                    {"text": "🖥️ 返回节点详情", "callback_data": f"act:node_detail:{node_idx if node_idx is not None else 0}"},
+                                    {"text": "📋 节点列表", "callback_data": "nav:nodes"}
+                                ]
+                            ]
+                        }
+                        self.send_msg(chat_id, "\n".join(sec_lines), reply_markup=kb)
                     else:
                         t0 = time.time()
                         latency = None
@@ -1112,15 +1394,15 @@ class SecurityBot:
                             f"💻 <b>操作系统</b>: <code>{html_escape(os_name)}</code>\n"
                             f"📡 <b>实时网络</b>: {lat_str}\n"
                             f"🛡️ <b>防护引擎</b>: 🟢 Systemd 守护进程常驻保活 (秒级/分钟级检测)\n"
-                            f"⏰ <b>早报机制</b>: 每天早晨 09:00 由该机器本地自动汇总生成并推送\n"
+                            f"💡 <b>攻防指标</b>: ⚠️ 尚未配置 SSH 密码，无法主动拉取实时防御数据。\n"
                             f"📦 <b>纳管时间</b>: <code>{created}</code>\n"
                             f"━━━━━━━━━━━━━━━━━━\n"
-                            f"<i>提示：该节点由其本地 Systemd 守护引擎自主执行全天候安全审计。</i>"
+                            f"<i>点击下方【🔑 配置 SSH 密码】按钮输入密码后，即可实时拉取该节点的拦截与系统指标！</i>"
                         )
                         kb = {
                             "inline_keyboard": [
                                 [
-                                    {"text": "🔍 即时安全巡检", "callback_data": f"act:chk_host:{target_host}"},
+                                    {"text": "🔑 配置 SSH 密码", "callback_data": f"act:pwd_node:{node_idx if node_idx is not None else 0}"},
                                     {"text": "📋 节点列表", "callback_data": "nav:nodes"}
                                 ]
                             ]
@@ -1236,8 +1518,14 @@ class SecurityBot:
                             f"└ ❌ 获取本地数据异常: <code>{html_escape(str(e)[:30])}</code>"
                         )
                 else:
-                    # 远程子节点（支持免密探活、guard守护状态检测及后续新加的任意节点）
+                    # 远程子节点（支持 SSH 实时拉取、HTTP 上报指标缓存与免密探活）
                     target_pwd = target.get("password")
+                    metrics = None
+                    if target_pwd:
+                        metrics = self.fetch_node_metrics_ssh(target, timeout=4)
+                    if not metrics:
+                        metrics = target.get("metrics")
+
                     t0 = time.time()
                     latency = None
                     try:
@@ -1249,14 +1537,65 @@ class SecurityBot:
                     except Exception:
                         lat_tag = "🔴 无法连接 (离线或端口未通)"
 
-                    sec_lines = [
-                        f"🏷️ <b>[{idx+1}] {html_escape(name)}</b> · <code>{host}:{port}</code> <i>(受控子节点)</i>",
-                        f"├ 📡 <b>实时网络</b>: {lat_tag}",
-                        f"├ 💻 <b>操作系统</b>: <code>{html_escape(os_name)}</code>",
-                        f"├ 🛡️ <b>防护引擎</b>: 🟢 Systemd 守护进程常驻保活 (秒级检测)",
-                        f"└ ⏰ <b>告警审计</b>: 本地全天候自主阻断与开机重启自启通知"
-                    ]
-                    node_sections.append("\n".join(sec_lines))
+                    if metrics:
+                        ssh_cnt = metrics.get("ssh_fail_count", 0)
+                        scan_cnt = metrics.get("scan_count", 0)
+                        web_cnt = metrics.get("login_fail_count", 0)
+                        node_attacks = ssh_cnt + scan_cnt + web_cnt
+                        total_attacks += node_attacks
+                        banned_cnt = metrics.get("banned_count", 0)
+                        total_bans += banned_cnt
+
+                        cert_info = ""
+                        if metrics.get("nearest_cert"):
+                            dom, days = metrics["nearest_cert"]
+                            cert_info = f" · 证书剩 {days}天"
+
+                        backup_info = ""
+                        if metrics.get("backup_status"):
+                            backup_info = f" · {metrics['backup_status']}"
+
+                        sec_lines = [
+                            f"🏷️ <b>[{idx+1}] {html_escape(name)}</b> · <code>{host}</code> <i>(受控子节点)</i>",
+                            f"├ 🖥️ <b>SSH防爆破</b>: 拦截 <code>{ssh_cnt:,}</code> 次 | 封禁中: <code>{banned_cnt}</code> 个",
+                            f"├ 🌐 <b>Web扫描探测</b>: <code>{scan_cnt}</code> 次 | 登录失败: <code>{web_cnt}</code> 次",
+                            f"├ ⚠️ <b>疑似陌生登录</b>: <code>{metrics.get('stranger_logins', 0)}</code> 次",
+                        ]
+
+                        top_logins = metrics.get("top_login_details", [])
+                        if top_logins:
+                            sec_lines.append("├ 🚨 <b>撞密码最多的来源 IP</b>:")
+                            for item in top_logins[:3]:
+                                ip_str = item.get("ip")
+                                cnt = item.get("count", 0)
+                                geo = item.get("geo", "未知")
+                                sec_lines.append(f"│  • <code>{ip_str}</code> ×{cnt} (<code>{html_escape(geo)}</code>)")
+
+                        top_probes = metrics.get("top_probe_details", [])
+                        if top_probes:
+                            sec_lines.append("├ 🔍 <b>扫描探测最多的来源 IP</b>:")
+                            for item in top_probes[:2]:
+                                ip_str = item.get("ip")
+                                cnt = item.get("count", 0)
+                                geo = item.get("geo", "未知")
+                                sec_lines.append(f"│  • <code>{ip_str}</code> ×{cnt} (<code>{html_escape(geo)}</code>)")
+
+                        disk_pct = metrics.get("disk_percent", "未知")
+                        disk_free = metrics.get("disk_free_gb", "未知")
+                        mem_avail = metrics.get("mem_avail_mb", "未知")
+                        sec_lines.append(
+                            f"└ 💾 <b>系统负载</b>: 磁盘 <code>{disk_pct}%</code> (剩 {disk_free}G) · 内存可用 <code>{mem_avail}MB</code>{cert_info}{backup_info}"
+                        )
+                        node_sections.append("\n".join(sec_lines))
+                    else:
+                        sec_lines = [
+                            f"🏷️ <b>[{idx+1}] {html_escape(name)}</b> · <code>{host}:{port}</code> <i>(受控子节点)</i>",
+                            f"├ 📡 <b>实时网络</b>: {lat_tag}",
+                            f"├ 💻 <b>操作系统</b>: <code>{html_escape(os_name)}</code>",
+                            f"├ 🛡️ <b>防护引擎</b>: 🟢 Systemd 守护进程常驻保活 (秒级检测)",
+                            f"└ 💡 <b>攻防指标</b>: ⚠️ 尚未配置 SSH 密码。在 /nodes 中点击【🔑 配置 SSH 密码】即可同步该机器的攻防与负载指标！"
+                        ]
+                        node_sections.append("\n".join(sec_lines))
 
             nodes_body = "\n\n".join(node_sections)
             final_report = (
@@ -1434,6 +1773,9 @@ class SecurityBot:
         elif data.startswith("act:ren_node:"):
             idx = int(data.split(":")[-1])
             self.prompt_rename_node(chat_id, idx, msg_id)
+        elif data.startswith("act:pwd_node:"):
+            idx = int(data.split(":")[-1])
+            self.prompt_node_password(chat_id, idx, msg_id)
         elif data.startswith("act:ren_to:"):
             parts = data.split(":", 3)
             idx = int(parts[2])
@@ -1605,6 +1947,55 @@ class SecurityBot:
                     self.send_msg(chat_id, f"❌ 未找到匹配的节点: <code>{html_escape(target_ident)}</code>\n发送 /nodes 可查看当前节点列表与序号。")
                     return
 
+        # 密码配置指令 (/pwd)
+        is_pwd_cmd = cmd_word in ("/pwd", "/password", "配置密码") or cmd_word.startswith("/pwd@") or cmd_word.startswith("/password@")
+        if is_pwd_cmd:
+            parts = text.strip().split(maxsplit=2)
+            nodes = load_nodes()
+            if len(parts) == 1:
+                btn_rows = []
+                for idx, n in enumerate(nodes):
+                    if not n.get("is_local"):
+                        n_name = n.get("name", "未命名")
+                        btn_rows.append([
+                            {"text": f"🔑 {idx + 1}. {n_name}", "callback_data": f"act:pwd_node:{idx}"}
+                        ])
+                btn_rows.append([{"text": "🔙 返回节点列表", "callback_data": "nav:nodes"}])
+                self.send_msg(
+                    chat_id,
+                    "🔑 <b>请点击选择要配置 SSH 密码的受控节点：</b>\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    "💡 <i>配置密码后，中央控制台即可实时拉取该节点的拦截、攻击源 IP 与负载指标！</i>",
+                    reply_markup={"inline_keyboard": btn_rows}
+                )
+                return
+            elif len(parts) == 2:
+                arg = parts[1].strip()
+                if arg.isdigit() and 1 <= int(arg) <= len(nodes):
+                    self.prompt_node_password(chat_id, int(arg) - 1)
+                    return
+                # 若只有 2 台机器（1台主机+1台远程），且参数不是序号，推断为密码
+                if len(nodes) == 2 and not nodes[1].get("is_local"):
+                    self.verify_and_save_node_password(chat_id, 1, arg)
+                    return
+            elif len(parts) >= 3:
+                target_ident = parts[1].strip()
+                pwd = parts[2].strip()
+                found_idx = None
+                if target_ident.isdigit() and 1 <= int(target_ident) <= len(nodes):
+                    found_idx = int(target_ident) - 1
+                else:
+                    for i, n in enumerate(nodes):
+                        if n.get("host") == target_ident or target_ident in n.get("name", ""):
+                            found_idx = i
+                            break
+                if found_idx is not None and not nodes[found_idx].get("is_local"):
+                    self.verify_and_save_node_password(chat_id, found_idx, pwd)
+                    return
+                else:
+                    self.send_msg(chat_id, f"❌ 未找到匹配的受控节点: <code>{html_escape(target_ident)}</code>")
+                    return
+
         # 如果处于等待改名状态 (点击了改名按钮后直接回复文字)
         if current_state == "waiting_rename_node":
             idx = state_data.get("node_idx")
@@ -1638,6 +2029,24 @@ class SecurityBot:
                     f"新名称: <b>{html_escape(new_name)}</b>"
                 )
                 self.show_nodes_menu(chat_id)
+            else:
+                self.send_msg(chat_id, "❌ 节点序号无效！")
+            return
+
+        # 如果处于等待配置受控节点 SSH 密码状态
+        if current_state == "waiting_node_pwd":
+            idx = state_data.get("node_idx")
+            pwd = text.strip()
+            self.user_states.pop(chat_id, None)
+
+            if not pwd:
+                self.send_msg(chat_id, "❌ 密码不能为空！")
+                self.show_nodes_menu(chat_id)
+                return
+
+            nodes = load_nodes()
+            if idx is not None and 0 <= idx < len(nodes):
+                self.verify_and_save_node_password(chat_id, idx, pwd)
             else:
                 self.send_msg(chat_id, "❌ 节点序号无效！")
             return
