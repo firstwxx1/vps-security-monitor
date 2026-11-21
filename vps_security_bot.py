@@ -333,7 +333,7 @@ class SecurityBot:
                         return ip
             except Exception:
                 continue
-        self._cached_public_ip = "45.130.166.10"
+        self._cached_public_ip = ""
         return self._cached_public_ip
 
     def get_registration_secret(self):
@@ -1917,7 +1917,7 @@ class SecurityBot:
                 "🚀 <b>【全自动向导部署 VPS】· 第 1 步</b>\n"
                 "━━━━━━━━━━━━━━━━━━\n"
                 "👉 <b>请输入目标 VPS 的 IP 地址</b>：\n"
-                "例如直接回复：<code>107.172.83.41</code>",
+                "例如直接回复：<code>203.0.113.10</code>",
                 reply_markup={"inline_keyboard": [[{"text": "🔙 取消添加", "callback_data": "act:add_wiz_cancel"}]]}
             )
         elif data == "act:add_wiz_port:22":
@@ -1950,7 +1950,7 @@ class SecurityBot:
                 "━━━━━━━━━━━━━━━━━━\n"
                 "适合不想提供 SSH 密码或已经在目标机安装过脚本的机器。\n\n"
                 "请直接在当前聊天窗口回复：<code>IP [别名]</code>\n"
-                "例如回复：<code>107.172.83.41 香港CN2</code>",
+                "例如回复：<code>203.0.113.10 香港CN2</code>",
                 reply_markup={"inline_keyboard": [[{"text": "🔙 取消返回", "callback_data": "nav:home"}]]}
             )
         elif data == "act:one_click_cmd":
@@ -2080,8 +2080,8 @@ class SecurityBot:
                 "━━━━━━━━━━━━━━━━━━\n"
                 "请直接在当前聊天窗口回复要封禁的 IP 地址，可附加时长与原因：\n\n"
                 "👉 格式：<code>IP [封禁小时数(默认0为永久)] [原因]</code>\n"
-                "👉 范例：<code>103.205.248.51 恶意爆破SSH</code> (默认永久封禁)\n"
-                "👉 或指定时长：<code>103.205.248.51 48 临时封禁48小时</code>\n\n"
+                "👉 范例：<code>198.51.100.25 恶意爆破SSH</code> (默认永久封禁)\n"
+                "👉 或指定时长：<code>198.51.100.25 48 临时封禁48小时</code>\n\n"
                 "🛡️ <i>封禁规则将实时下发到本机及所有已纳管远程 VPS 的 Linux 内核 iptables 中！</i>",
                 reply_markup={"inline_keyboard": [[{"text": "🔙 取消返回黑名单", "callback_data": "act:banned_list:1"}]]}
             )
@@ -2152,8 +2152,8 @@ class SecurityBot:
                     chat_id,
                     "💡 <b>/ban 用法</b>：\n"
                     "<code>/ban &lt;IP&gt; [时长(小时, 0为永久)] [原因]</code>\n"
-                    "例如：<code>/ban 103.205.248.51</code> (默认永久封禁)\n"
-                    "或：<code>/ban 103.205.248.51 48 恶意爆破</code>"
+                    "例如：<code>/ban 198.51.100.25</code> (默认永久封禁)\n"
+                    "或：<code>/ban 198.51.100.25 48 恶意爆破</code>"
                 )
                 return
             target_ip = parts[1].strip()
@@ -2283,7 +2283,7 @@ class SecurityBot:
                     )
                     return
 
-            # Case C: 用户发送了 3 个参数，例如: /rename 2 日本vpn 或 /rename 8.209.239.164 阿里云
+            # Case C: 用户发送了 3 个参数，例如: /rename 2 日本vpn 或 /rename 192.0.2.88 阿里云
             else:
                 target_ident = parts[1].strip()
                 new_name = parts[2].strip()
@@ -2451,7 +2451,7 @@ class SecurityBot:
             else:
                 self.send_msg(
                     chat_id,
-                    f"❌ <b>IP 地址格式不正确！</b>\n请输入标准 IPv4 地址（例如：<code>107.172.83.41</code>），或点击下方取消：",
+                    f"❌ <b>IP 地址格式不正确！</b>\n请输入标准 IPv4 地址（例如：<code>203.0.113.10</code>），或点击下方取消：",
                     reply_markup={"inline_keyboard": [[{"text": "🔙 取消添加", "callback_data": "act:add_wiz_cancel"}]]}
                 )
                 return

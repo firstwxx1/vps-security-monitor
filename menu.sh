@@ -861,7 +861,7 @@ except Exception:
     print('')
 EOF
 )
-                local pub_ip=$(curl -sS -m 4 https://api.ipify.org 2>/dev/null || curl -sS -m 4 ifconfig.me 2>/dev/null || echo "45.130.166.10")
+                local pub_ip=$(curl -sS -m 4 https://api.ipify.org 2>/dev/null || curl -sS -m 4 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
                 echo -e "只需在你要纳管监控的${GREEN}任意 Linux VPS 终端${PLAIN}上粘贴运行以下命令："
                 echo ""
                 echo -e "${YELLOW}curl -fsSL https://raw.githubusercontent.com/firstwxx1/vps-security-monitor/main/install.sh | bash -s -- --token '${token}' --chat '${chat_id}' --master '${pub_ip}:9527' --auto${PLAIN}"
