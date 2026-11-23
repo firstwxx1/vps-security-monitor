@@ -660,6 +660,8 @@ User=root
 WorkingDirectory=/opt/vps-security-monitor
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 /opt/vps-security-monitor/vps_security_bot.py
+MemoryHigh=96M
+MemoryMax=160M
 Restart=always
 RestartSec=5
 
